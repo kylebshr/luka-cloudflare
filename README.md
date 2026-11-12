@@ -56,8 +56,10 @@ Secrets are per environment: `npx wrangler secret put <NAME>` sets production's,
 
 Every event is a structured log line (see the Telemetry section of the architecture doc).
 Logs and traces are in the Cloudflare dashboard under Workers Observability, and
-`npx wrangler tail` streams them live. To export them over OpenTelemetry, create an OTLP
-destination in the dashboard and add its name to `observability.logs.destinations` and/or
+`npx wrangler tail` streams them live. Both are also exported over OpenTelemetry to Grafana
+Cloud, through the `grafana-logs` and `grafana-traces` destinations. A destination is created
+in the Cloudflare dashboard (Workers Observability, Destinations), where it holds the OTLP
+endpoint and credentials, and is listed by name under `observability.logs.destinations` or
 `observability.traces.destinations` in `wrangler.jsonc`.
 
 ## Design

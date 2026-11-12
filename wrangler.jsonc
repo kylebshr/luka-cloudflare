@@ -10,13 +10,19 @@
   "workers_dev": true,
   "preview_urls": false,
   // Telemetry is structured logs (src/telemetry.ts) plus automatic traces, kept in Workers
-  // Observability. To also export them over OpenTelemetry, create an OTLP destination in
-  // the Cloudflare dashboard and list its name under `logs` and/or `traces`, e.g.
-  // "destinations": ["<destination name>"].
+  // Observability and exported over OpenTelemetry to Grafana Cloud. The destinations are
+  // created in the Cloudflare dashboard (they hold the Grafana credentials) and referenced
+  // here by name.
   "observability": {
     "enabled": true,
-    "logs": { "enabled": true, "invocation_logs": true, "head_sampling_rate": 1, "persist": true },
-    "traces": { "enabled": true, "head_sampling_rate": 1, "persist": true }
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true,
+      "head_sampling_rate": 1,
+      "persist": true,
+      "destinations": ["grafana-logs"]
+    },
+    "traces": { "enabled": true, "head_sampling_rate": 1, "persist": true, "destinations": ["grafana-traces"] }
   },
   "durable_objects": {
     "bindings": [
