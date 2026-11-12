@@ -3,6 +3,10 @@
   "name": "luka",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-01",
+  // Served at <name>.<subdomain>.workers.dev. Preview URLs stay off: a preview version
+  // would run against the same Durable Objects as the live one.
+  "workers_dev": true,
+  "preview_urls": false,
   // Telemetry is structured logs (src/telemetry.ts) plus automatic traces, kept in Workers
   // Observability. To also export them over OpenTelemetry, create an OTLP destination in
   // the Cloudflare dashboard and list its name under `logs` and/or `traces`, e.g.
