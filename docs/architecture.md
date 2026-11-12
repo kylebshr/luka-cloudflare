@@ -159,10 +159,11 @@ Every event is one structured log line, `console.<level>({ ...attributes, event 
 a human-readable `message` where one helps. Each occurrence logs exactly once; there are
 no separate plain-text lines. Workers Logs indexes every field, and Workers Observability
 keeps logs and automatic traces (`observability` in `wrangler.jsonc`, full sampling,
-persisted) and can export both over OpenTelemetry to OTLP destinations. A destination is
-created in the Cloudflare dashboard, and its name is then listed under
-`observability.logs.destinations` / `observability.traces.destinations`. The Worker
-itself has no exporter code and no telemetry secrets.
+persisted) and exports both over OpenTelemetry to Grafana Cloud. A destination is
+created in the Cloudflare dashboard, where it holds the OTLP endpoint and credentials, and
+its name is listed under `observability.logs.destinations` (`grafana-logs`) or
+`observability.traces.destinations` (`grafana-traces`). The Worker itself has no exporter
+code and no telemetry secrets.
 
 Logs never carry a full username (`user` is the redacted `k•••@example.com` form), a
 password, or a full token (`token_prefix` / `pts_prefix` / `activity_prefix` are 8
