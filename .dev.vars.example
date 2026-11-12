@@ -1,0 +1,6 @@
+# Copy to .dev.vars for `wrangler dev`. Leave these out to run without APNs.
+
+# APNs: contents of the .p8 key (literal \n escapes are fine), its key ID, and the team ID.
+PUSH_NOTIFICATION_PEM="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
+PUSH_NOTIFICATION_ID=
+TEAM_IDENTIFIER=
