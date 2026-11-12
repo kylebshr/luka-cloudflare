@@ -43,15 +43,14 @@ Secrets are per environment: `npx wrangler secret put <NAME>` sets production's,
 
 ## Deploying
 
-- Merges to `main` deploy production through GitHub Actions (`.github/workflows/ci.yml`),
-  after lint, typecheck, and tests pass. Pull requests run the checks only.
+- Merges to `main` deploy production (the `luka` Worker) through Cloudflare's Git
+  integration: the repository is connected to the Worker in the Cloudflare dashboard, with
+  `npm run deploy` as the deploy command. Preview builds are off, because a preview of a
+  branch would run against production's Durable Objects.
+- GitHub Actions (`.github/workflows/ci.yml`) runs lint, typecheck, and tests on pull
+  requests and on `main`. It does not deploy.
 - Staging (`luka-staging`, a separate Worker with its own Durable Objects) is deployed by
-  hand: run the CI workflow from the Actions tab (it deploys the chosen branch), or
-  `npm run deploy:staging` locally.
-- The workflow needs two repository secrets: `CLOUDFLARE_ACCOUNT_ID`, and
-  `CLOUDFLARE_API_TOKEN`, an API token created from the **Edit Cloudflare Workers**
-  template (its Account › Workers Scripts › Edit permission covers uploading the Worker
-  and its Durable Object migrations).
+  hand with `npm run deploy:staging`, after `npx wrangler login`.
 
 ## Observability
 
