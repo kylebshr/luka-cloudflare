@@ -28,11 +28,8 @@ import {
   dataTTLSeconds,
   decayedRecovery,
   decodingErrorRetryLimit,
-  delayUntilNextReading,
   errorBackoff,
-  escalatedRecovery,
   genericErrorRetryLimit,
-  honoredRetryAfter,
   jittered,
   maxInterval,
   maximumDuration,
@@ -40,7 +37,8 @@ import {
   overduePollCap,
   overdueReschedule,
   pollFloor,
-  rateLimitMinDelay,
+  type RateLimitPlan,
+  rateLimitPlan,
   readingInterval,
   readingPropagationBuffer,
   staleLevel,
@@ -576,8 +574,10 @@ export class UserSession extends DurableObject<Env> {
       await this.#endAllTokens(cycle, "dexcomError");
     } else if (error instanceof DexcomError && error.httpResponse?.statusCode === 429) {
       // A rate limit whose body decoded as a Dexcom JSON error (app-level limiting, vs.
-      // the Cloudflare HTML pages that surface as DexcomDecodingError). Back off the same
-      // way rather than retrying on the normal cadence and ending after a few attempts.
+      // the edge limiter's plain-text and HTML bodies that surface as DexcomDecodingError).
+      // Handle it the same way rather than retrying on the normal cadence and ending
+      // after a few attempts.
+      const plan = rateLimitPlan(state, error.httpResponse, Date.now());
       emit(
         "poll_error",
         {
@@ -585,18 +585,23 @@ export class UserSession extends DurableObject<Env> {
           user: logID,
           error_type: "dexcom",
           status_code: "429",
+          endpoint: lastPathComponent(error.httpResponse.url) ?? "unknown",
           error_code: error.code ?? "unknown",
+          error: error.message,
           ...retryAfterAttributes(error.httpResponse),
+          ...rateLimitAttributes(plan, error.httpResponse),
           retry_count: retryCount,
           will_end: "false",
         },
         "warn",
       );
-      this.#rescheduleAfterRateLimit(cycle, error.httpResponse);
+      this.#rescheduleAfterRateLimit(cycle, plan);
       await this.#sendStaleUpdatesIfNeeded(cycle, "Rate limited");
     } else if (error instanceof DexcomDecodingError) {
       const willEnd = state.pollInterval >= maxInterval && state.retryCount > decodingErrorRetryLimit;
       const ending = willEnd ? ", done retrying, ending all tokens" : "";
+      const plan =
+        error.statusCode === 429 && !willEnd ? rateLimitPlan(state, error.httpResponse, Date.now()) : undefined;
       emit(
         "poll_error",
         {
@@ -610,10 +615,12 @@ export class UserSession extends DurableObject<Env> {
           error: error.errorDescription,
           // Whether Dexcom sent Retry-After at all, and how we parsed it.
           ...retryAfterAttributes(error.httpResponse),
+          ...(plan && rateLimitAttributes(plan, error.httpResponse)),
           retry_count: retryCount,
           will_end: String(willEnd),
-          // On a 429, a Cloudflare HTML error page here means edge/per-IP rate limiting; a
-          // Dexcom JSON FaultException means app-level limiting.
+          // On a 429, plain text ("Too many requests.") or a Cloudflare HTML error page
+          // here means the edge limiter answered; a Dexcom JSON FaultException means
+          // app-level limiting.
           body_prefix: error.body.slice(0, 200),
         },
         willEnd ? "error" : "warn",
@@ -622,8 +629,8 @@ export class UserSession extends DurableObject<Env> {
         await this.#endAllTokens(cycle, "tooManyRetries");
         return;
       }
-      if (error.statusCode === 429) {
-        this.#rescheduleAfterRateLimit(cycle, error.httpResponse);
+      if (plan) {
+        this.#rescheduleAfterRateLimit(cycle, plan);
       } else {
         this.#rescheduleAfterError(cycle);
       }
@@ -682,20 +689,22 @@ export class UserSession extends DurableObject<Env> {
   }
 
   /**
-   * After a 429: poll next at a reading boundary at least the recovery floor out (never
-   * sooner than `rateLimitMinDelay`, or a longer `Retry-After`), skipping any reading
-   * about to land, since retrying right before it just re-triggers the 429. Once the
-   * limit clears, the floor eases polling back in instead of resuming the aggressive
-   * overdue cadence.
+   * After a 429, applies the `rateLimitPlan`: either one quick retry on the server's short
+   * `Retry-After`, leaving the session out of recovery, or a backoff to a reading boundary
+   * at least the recovery floor out. Once the limit clears, the floor eases polling back
+   * in instead of resuming the aggressive overdue cadence.
    */
-  #rescheduleAfterRateLimit(cycle: Cycle, httpResponse: DexcomHTTPResponse | undefined): void {
+  #rescheduleAfterRateLimit(cycle: Cycle, plan: RateLimitPlan): void {
     const { state } = cycle;
     const pollInterval = Math.min(state.pollInterval * errorBackoff, maxInterval);
-    const recovery = escalatedRecovery(state.recoveryInterval, honoredRetryAfter(httpResponse));
-    state.recoveryInterval = recovery;
+    if (plan.action === "quick_retry") {
+      state.rateLimitRetried = true;
+    } else {
+      state.recoveryInterval = plan.recovery;
+      delete state.rateLimitRetried;
+    }
     state.retryCount += 1;
-    const delay = delayUntilNextReading(state.lastReading?.date, Date.now(), Math.max(rateLimitMinDelay, recovery));
-    this.#reschedule(cycle, { pollInterval, delay, resetRetries: false });
+    this.#reschedule(cycle, { pollInterval, delay: plan.delay, resetRetries: false });
   }
 
   #rescheduleAfterError(cycle: Cycle): void {
@@ -729,6 +738,7 @@ export class UserSession extends DurableObject<Env> {
     if (options.resetRetries) {
       state.retryCount = 0;
       state.recoveryInterval = decayedRecovery(state.recoveryInterval);
+      delete state.rateLimitRetried;
     }
     cycle.nextPollAt = Date.now() + options.delay * 1000;
   }
@@ -745,6 +755,7 @@ export class UserSession extends DurableObject<Env> {
       user: cycle.logID,
       delay_s: String(delay),
       poll_interval: String(Math.trunc(cycle.state.pollInterval)),
+      recovery_interval: secondsAttribute(cycle.state.recoveryInterval),
       retry_count: String(cycle.state.retryCount),
     });
   }
@@ -1267,10 +1278,29 @@ function pollOutcome(result: PollResult): Record<string, string> {
   };
 }
 
+/** Whole seconds, or "none". */
+function secondsAttribute(seconds: number | undefined): string {
+  return seconds === undefined ? "none" : String(Math.trunc(seconds));
+}
+
+/**
+ * What a 429 led to, plus the response's headers: the only evidence of which limiter
+ * answered (edge vs. app, per-IP vs. per-account). Cookies are left out.
+ */
+function rateLimitAttributes(plan: RateLimitPlan, httpResponse: DexcomHTTPResponse): Record<string, string> {
+  const { "set-cookie": _, ...headers } = httpResponse.headers;
+  return {
+    rate_limit_action: plan.action,
+    retry_delay_s: String(Math.round(plan.delay)),
+    recovery_interval: secondsAttribute(plan.action === "backoff" ? plan.recovery : undefined),
+    response_headers: JSON.stringify(headers).slice(0, 1000),
+  };
+}
+
 function retryAfterAttributes(httpResponse: DexcomHTTPResponse | undefined): Record<string, string> {
   const retryAfter = httpResponse?.retryAfter;
   return {
-    retry_after: retryAfter === undefined ? "none" : String(Math.trunc(retryAfter)),
+    retry_after: secondsAttribute(retryAfter),
     retry_after_header: httpResponse?.header("Retry-After") ?? "none",
   };
 }

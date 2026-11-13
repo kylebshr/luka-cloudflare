@@ -16,7 +16,10 @@ import {
   overdueReschedule,
   overdueRetryInterval,
   pollFloor,
+  quickRetryMargin,
+  quickRetryMaxRetryAfter,
   rateLimitMinDelay,
+  rateLimitPlan,
   readingInterval,
   readingPropagationBuffer,
   recoveryStartInterval,
@@ -129,6 +132,46 @@ describe("overdueReschedule", () => {
 
     // Past the window, a boundary sooner than the floor is skipped for the next one.
     expect(overdue(450, minInterval, 240).delay).toBe(450 + readingPropagationBuffer); // 15:00, not 10:00
+  });
+});
+
+describe("rate limit plan", () => {
+  const limited = (retryAfter?: string) =>
+    new DexcomHTTPResponse(429, undefined, retryAfter === undefined ? {} : { "Retry-After": retryAfter });
+  const healthy = { lastReading: { value: 100, trend: "Flat" as const, date: lastReading } };
+  const now = at(readingInterval + readingPropagationBuffer);
+  const backoff = { action: "backoff", delay: readingInterval, recovery: recoveryStartInterval };
+
+  it("retries once on a short Retry-After, without entering recovery", () => {
+    expect(rateLimitPlan(healthy, limited("17"), now, () => 0)).toEqual({
+      action: "quick_retry",
+      delay: 17 + quickRetryMargin,
+    });
+    // Jittered, so sessions limited at the same instant don't retry in lockstep.
+    expect(rateLimitPlan(healthy, limited("17"), now, () => 1)).toEqual({
+      action: "quick_retry",
+      delay: 17 + quickRetryMargin + rescheduleJitterMax,
+    });
+    expect(rateLimitPlan(healthy, limited(String(quickRetryMaxRetryAfter)), now).action).toBe("quick_retry");
+  });
+
+  it("backs off without a usable or short Retry-After", () => {
+    expect(rateLimitPlan(healthy, limited(), now)).toEqual(backoff);
+    expect(rateLimitPlan(healthy, undefined, now)).toEqual(backoff);
+    expect(rateLimitPlan(healthy, limited("soon"), now)).toEqual(backoff);
+    expect(rateLimitPlan(healthy, limited(String(quickRetryMaxRetryAfter + 1)), now)).toEqual(backoff);
+  });
+
+  it("backs off when the quick retry was rate limited too", () => {
+    expect(rateLimitPlan({ ...healthy, rateLimitRetried: true }, limited("17"), now)).toEqual(backoff);
+  });
+
+  it("escalates instead of retrying while recovering", () => {
+    expect(rateLimitPlan({ ...healthy, recoveryInterval: 300 }, limited("17"), now)).toEqual({
+      action: "backoff",
+      delay: 2 * readingInterval,
+      recovery: 600,
+    });
   });
 });
 
