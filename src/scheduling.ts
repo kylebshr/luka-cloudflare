@@ -1,16 +1,11 @@
 // Poll policy: when to poll Dexcom next, how to back off, and stale levels. Pure functions
-// and constants ported from the Vapor server's `LiveActivityScheduler`.
+// and constants.
 //
 // Units: intervals and delays are seconds; instants are epoch milliseconds.
 
 import type { DexcomHTTPResponse } from "./dexcom";
 import { type GlucoseReading, type PollState, StaleLevel, type TokenEntry } from "./types";
 
-// Baseline floor on poll spacing for healthy sessions, and the point below which a
-// post-429 recovery floor clears. Overdue rechecks use the quicker overdueRetryInterval
-// cadence instead — see overdueReschedule.
-export const minInterval = 60;
-export const maxInterval = 60;
 // Recheck cadences for a reading that is due but hasn't appeared (the first recheck is
 // quicker), and how long past the expected arrival they apply — see overdueReschedule.
 export const overdueFirstRetryInterval = 20;
@@ -29,19 +24,20 @@ export const offlineInterval = 60 * 15;
 export const minStaleDateBuffer = 60 * 2;
 /** Max lifetime of a Live Activity before the server ends it. */
 export const maximumDuration = 60 * 60 * 7;
-export const backoff = 2.0;
-export const errorBackoff = 3;
-export const decodingErrorRetryLimit = 10;
-export const genericErrorRetryLimit = 6;
-// After a rate limit (429), poll no more often than this at first, then ease back toward
-// minInterval (recoveryInterval shrinks to recoveryDecay of itself on each healthy poll)
-// rather than immediately resuming the aggressive overdue cadence. Repeated 429s double
-// the floor instead — see escalatedRecovery.
+// A failed poll (network error, Dexcom 5xx, undecodable body) retries on this spacing for
+// the first `errorQuickRetryLimit` consecutive failures, then only at reading boundaries:
+// a blip is retried within a minute, and a long outage costs one read per reading.
+// Failures never end a session — it keeps retrying, showing stale data, until its
+// activities reach their max duration. Only rejected credentials end it early.
+export const errorRetryInterval = 60;
+export const errorQuickRetryLimit = 5;
+// After a rate limit (429), poll no more often than this at first, then ease back
+// (recoveryInterval shrinks to recoveryDecay of itself on each healthy poll, and clears
+// once it reaches recoveryClearInterval) rather than immediately resuming the aggressive
+// overdue cadence. Repeated 429s double the floor instead — see escalatedRecovery.
 export const recoveryStartInterval = 300;
 export const recoveryDecay = 0.6;
-// On a 429, never reschedule sooner than this. A reading about to land would just get
-// rate-limited again, so skip it and aim for a later one — at least ~4 minutes out.
-export const rateLimitMinDelay = 60 * 4;
+export const recoveryClearInterval = 60;
 // Ceiling on the escalating recovery floor (see escalatedRecovery). Wide enough to skip
 // 1–2 reading boundaries per poll so a drained account budget can rebuild, while still
 // refreshing the Live Activity every few minutes.
@@ -71,8 +67,8 @@ export const dataTTLSeconds = 8 * 60 * 60;
  * Delay until the next reading boundary at least `minimumDelay` out, phase-anchored to
  * the last reading — readings arrive every `readingInterval`, plus
  * `readingPropagationBuffer` for Share-side propagation. Boundaries closer than
- * `minimumDelay` are skipped: the rate-limit path relies on this so a retry never lands
- * just before a reading and re-triggers the 429.
+ * `minimumDelay` are skipped, so a backed-off poll waits out its whole floor and then
+ * lands just after a reading rather than just before one.
  */
 export function delayUntilNextReading(lastReadingDate: number | undefined, now: number, minimumDelay = 0): number {
   if (lastReadingDate === undefined) {
@@ -108,21 +104,30 @@ export function delayUntilNextReading(lastReadingDate: number | undefined, now: 
 export function overdueReschedule(options: {
   lastReadingDate: number;
   now: number;
-  previousPollInterval: number;
+  /** Whether the poll that found the reading overdue was itself a quick recheck. */
+  rechecking: boolean;
   recoveryInterval: number | undefined;
-}): { delay: number; pollInterval: number } {
-  const { lastReadingDate, now, previousPollInterval, recoveryInterval } = options;
+}): { delay: number; rechecking: boolean } {
+  const { lastReadingDate, now, rechecking, recoveryInterval } = options;
   const timeSinceLastReading = (now - lastReadingDate) / 1000;
   if (recoveryInterval === undefined && timeSinceLastReading < readingInterval + overdueCatchupWindow) {
-    // Catch-up rechecks are the only polls scheduled with a sub-minute spacing, so a
-    // larger previous spacing means this poll wasn't one — it's the boundary poll
-    // itself, and its miss is the first recheck opportunity.
-    const isFirstRecheck = previousPollInterval > overdueRetryInterval;
-    const cadence = isFirstRecheck ? overdueFirstRetryInterval : overdueRetryInterval;
-    return { delay: cadence, pollInterval: cadence };
+    return { delay: rechecking ? overdueRetryInterval : overdueFirstRetryInterval, rechecking: true };
   }
-  const delay = delayUntilNextReading(lastReadingDate, now, recoveryInterval ?? 0);
-  return { delay, pollInterval: readingInterval };
+  return { delay: delayUntilNextReading(lastReadingDate, now, recoveryInterval ?? 0), rechecking: false };
+}
+
+/**
+ * Delay before retrying a failed poll: `errorRetryInterval` for the first
+ * `errorQuickRetryLimit` consecutive failures, then the next reading boundary. Never
+ * sooner than an active post-429 recovery floor.
+ */
+export function errorRetryDelay(
+  state: Pick<PollState, "retryCount" | "recoveryInterval" | "lastReading">,
+  now: number,
+): number {
+  const floor = Math.max(errorRetryInterval, state.recoveryInterval ?? 0);
+  if (state.retryCount < errorQuickRetryLimit) return floor;
+  return delayUntilNextReading(state.lastReading?.date, now, floor);
 }
 
 /**
@@ -159,8 +164,8 @@ export type RateLimitPlan =
  * header says the limit clears, without entering recovery. Everything else backs off: a 429 with
  * no or a long `Retry-After`, one that arrives while recovering, or one that follows a
  * quick retry (the header's promise didn't hold). Backing off raises the recovery floor
- * and aims for a reading boundary at least that far out (never sooner than
- * `rateLimitMinDelay`), skipping any reading about to land.
+ * and aims for a reading boundary at least that far out, skipping any reading about to
+ * land.
  */
 export function rateLimitPlan(
   state: Pick<PollState, "recoveryInterval" | "rateLimitRetried" | "lastReading">,
@@ -177,36 +182,27 @@ export function rateLimitPlan(
     return { action: "quick_retry", delay: retryAfter + quickRetryMargin };
   }
   const recovery = escalatedRecovery(state.recoveryInterval, honoredRetryAfter(httpResponse));
-  const delay = delayUntilNextReading(state.lastReading?.date, now, Math.max(rateLimitMinDelay, recovery));
+  const delay = delayUntilNextReading(state.lastReading?.date, now, recovery);
   return { action: "backoff", delay, recovery };
 }
 
 /**
  * Eases the post-rate-limit recovery floor back toward normal polling. Returns the next
- * floor, or undefined once it has shrunk back to (at or below) minInterval.
+ * floor, or undefined once it has shrunk back to (at or below) recoveryClearInterval.
  */
 export function decayedRecovery(current: number | undefined): number | undefined {
   if (current === undefined) return undefined;
   const next = current * recoveryDecay;
-  return next > minInterval ? next : undefined;
+  return next > recoveryClearInterval ? next : undefined;
 }
 
 /**
- * Minimum spacing between polls, raised to the recovery floor while easing back from a
- * rate limit so we don't immediately resume the aggressive overdue cadence.
+ * Poll spacing while a session has never seen a reading (fresh sensor, warmup). With no
+ * last reading to anchor a boundary to, poll at the sensor's own cadence — anything
+ * faster can't return something new. Sessions with an anchor use the overdue path
+ * instead. Still respects an active post-429 recovery floor.
  */
-export function pollFloor(state: Pick<PollState, "recoveryInterval">): number {
-  return Math.max(minInterval, state.recoveryInterval ?? 0);
-}
-
-/**
- * Upper bound on poll spacing while a session has never seen a reading (fresh sensor,
- * warmup). With no last reading to anchor a boundary to, the backoff grows toward
- * `readingInterval` (≈5 min) rather than pinning at `maxInterval` (60s) — polls faster
- * than the sensor's cadence can't return anything new. Sessions with an anchor use the
- * overdue path instead. Still respects an active post-429 recovery floor.
- */
-export function overduePollCap(state: Pick<PollState, "recoveryInterval">): number {
+export function unanchoredPollDelay(state: Pick<PollState, "recoveryInterval">): number {
   return Math.max(readingInterval, state.recoveryInterval ?? 0);
 }
 

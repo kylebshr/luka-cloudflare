@@ -111,7 +111,6 @@ describe("poll cycle", () => {
       sessionStartDate: T0,
       lastReading: r1,
       readings: [r0, r1],
-      pollInterval: 60,
       retryCount: 0,
     });
     // The next reading is due 5 minutes after r1, plus the propagation buffer.
@@ -137,7 +136,6 @@ describe("poll cycle", () => {
         status_code: "200",
         endpoint: "readings",
         latency_ms: "0",
-        poll_interval: "60",
         recovery_active: "false",
       }),
     ]);
@@ -186,14 +184,14 @@ describe("poll cycle", () => {
     // The boundary poll (5m20s after r1) misses: first recheck in 20s, then every 30s.
     await poll();
     expect((await stored()).nextPollAt).toBe(Date.now() + seconds(20));
-    expect((await stored()).state?.pollInterval).toBe(20);
+    expect((await stored()).state?.rechecking).toBe(true);
     await poll();
     expect((await stored()).nextPollAt).toBe(Date.now() + seconds(30));
 
     // Past the catch-up window (2 minutes after the expected reading): the next boundary.
     await pollAt(r1.date + minutes(8));
     expect((await stored()).nextPollAt).toBe(r1.date + minutes(10) + seconds(20));
-    expect((await stored()).state?.pollInterval).toBe(300);
+    expect((await stored()).state?.rechecking).toBeUndefined();
     expect(up.pushes.every((push) => push.aps["content-state"].c.value === 120)).toBe(true);
   });
 
@@ -228,24 +226,17 @@ describe("poll cycle", () => {
     expect((await stored()).state?.lastStaleUpdateMinutes).toBeUndefined();
   });
 
-  it("backs off toward the reading cadence while there's never been a reading", async () => {
+  it("polls at the reading cadence while there's never been a reading", async () => {
     await start();
     await poll();
     expect(up.eventsNamed("poll_empty")).toEqual([
       expect.objectContaining({ user: logID, retry_count: "0", minutes_since_last_reading: "unknown" }),
     ]);
     expect(up.eventsNamed("poll")[0]).toMatchObject({ outcome: "empty" });
-    let { state, nextPollAt } = await stored();
-    expect(nextPollAt).toBe(T0 + seconds(60));
-    expect(state?.pollInterval).toBe(120);
+    expect((await stored()).nextPollAt).toBe(T0 + minutes(5));
 
     await poll();
-    ({ state, nextPollAt } = await stored());
-    expect(nextPollAt).toBe(Date.now() + seconds(120));
-    expect(state?.pollInterval).toBe(240);
-    await poll();
-    await poll();
-    expect((await stored()).state?.pollInterval).toBe(300);
+    expect((await stored()).nextPollAt).toBe(T0 + minutes(10));
   });
 
   it("treats an empty response with a cached reading as an overdue reading", async () => {
@@ -303,7 +294,7 @@ describe("rate limits", () => {
       }),
     ]);
     let { state, nextPollAt } = await stored();
-    expect(state).toMatchObject({ recoveryInterval: 300, retryCount: 1, pollInterval: 60 });
+    expect(state).toMatchObject({ recoveryInterval: 300, retryCount: 1 });
     // At least the 300s floor, landing on the 10:20 boundary.
     expect(nextPollAt).toBe(r1.date + minutes(10) + seconds(20));
     expect(up.pushes.map((push) => push.aps["content-state"].r)).toEqual(["Rate limited"]);
@@ -321,7 +312,7 @@ describe("rate limits", () => {
     up.readings.push(fresh);
     await poll();
     ({ state, nextPollAt } = await stored());
-    expect(state).toMatchObject({ recoveryInterval: 360, retryCount: 0, pollInterval: 600 });
+    expect(state).toMatchObject({ recoveryInterval: 360, retryCount: 0 });
     expect(nextPollAt).toBe(fresh.date + minutes(5) + seconds(20));
     expect(await counts()).toMatchObject({ rateLimited: 1 });
   });
@@ -411,7 +402,7 @@ describe("rate limits", () => {
     up.readings.push(fresh);
     await poll();
     const { state, nextPollAt } = await stored();
-    expect(state).toMatchObject({ retryCount: 0, pollInterval: 60 });
+    expect(state).toMatchObject({ retryCount: 0 });
     expect(state?.lastReading).toEqual(fresh);
     expect(state?.recoveryInterval).toBeUndefined();
     expect(state?.rateLimitRetried).toBeUndefined();
@@ -432,7 +423,7 @@ describe("rate limits", () => {
 });
 
 describe("errors", () => {
-  it("retries a decoding error with backoff, then ends the session past the retry limit", async () => {
+  it("keeps retrying a decoding error, settling onto reading boundaries, without ending the session", async () => {
     await startAndPoll();
     up.clear();
     up.dexcom.ReadPublisherLatestGlucoseValues = () => new Response("<html>502</html>", { status: 502 });
@@ -443,26 +434,49 @@ describe("errors", () => {
       status_code: "502",
       will_end: "false",
     });
-    expect((await stored()).state).toMatchObject({ retryCount: 1, pollInterval: 60 });
+    expect((await stored()).state).toMatchObject({ retryCount: 1 });
     expect((await stored()).nextPollAt).toBe(Date.now() + seconds(60));
     expect(up.pushes[0]?.aps["content-state"].r).toBe("Dexcom error");
 
-    await runInDurableObject(session(), (_, state) => {
-      const poll = state.storage.kv.get<Record<string, unknown>>("state")!;
-      state.storage.kv.put("state", { ...poll, retryCount: 11 });
-    });
-    up.clear();
+    // The first five failures retry a minute apart; from the sixth, one poll per reading.
+    for (let attempt = 2; attempt <= 5; attempt++) {
+      await poll();
+      expect((await stored()).nextPollAt).toBe(Date.now() + seconds(60));
+    }
+    await poll(); // 10m20s after r1
+    expect((await stored()).nextPollAt).toBe(r1.date + minutes(15) + seconds(20));
+
+    // Far past the old retry limits, the session is still there, still retrying.
+    for (let attempt = 7; attempt <= 20; attempt++) await poll();
+    expect(up.eventsNamed("session_ended")).toEqual([]);
+    expect(up.eventsNamed("poll_error").at(-1)).toMatchObject({ will_end: "false", retry_count: "19" });
+    expect(up.pushes.map((push) => push.aps.event)).not.toContain("end");
+    expect(await counts()).toEqual({ sessions: 1, activities: 1, rateLimited: 0 });
+
+    // Dexcom comes back: the next poll delivers the reading and clears the count.
+    delete up.dexcom.ReadPublisherLatestGlucoseValues;
+    const fresh = reading(140, Date.now() - seconds(20));
+    up.readings.push(fresh);
     await poll();
-    expect(up.eventsNamed("poll_error")[0]).toMatchObject({ will_end: "true", retry_count: "11" });
-    expect(up.eventsNamed("session_ended")).toEqual([
-      expect.objectContaining({ user: logID, reason: "tooManyRetries", token_count: "1" }),
-    ]);
-    expect(up.pushes.map((push) => push.aps.event)).toEqual(["end"]);
-    expect((await stored()).state).toBeUndefined();
-    expect((await stored()).ended).toMatchObject({ "activity-a": { reason: "tooManyRetries" } });
+    expect((await stored()).state).toMatchObject({ retryCount: 0, lastReading: fresh });
   });
 
-  it("retries a network error, then ends after the generic retry limit", async () => {
+  it("clears the failure count on any response with readings, even without a new one", async () => {
+    await startAndPoll();
+    up.clear();
+    up.dexcom.ReadPublisherLatestGlucoseValues = () => {
+      throw new TypeError("Network connection lost.");
+    };
+    await poll();
+    await poll();
+    expect((await stored()).state?.retryCount).toBe(2);
+
+    delete up.dexcom.ReadPublisherLatestGlucoseValues;
+    await poll(); // 200, but r1 is still the latest
+    expect((await stored()).state?.retryCount).toBe(0);
+  });
+
+  it("retries a network error without ending the session", async () => {
     await startAndPoll();
     up.clear();
     up.dexcom.ReadPublisherLatestGlucoseValues = () => {
@@ -477,12 +491,11 @@ describe("errors", () => {
     });
     expect(up.pushes[0]?.aps["content-state"].r).toBe("Polling error");
 
-    for (let attempt = 2; attempt <= 6; attempt++) await poll();
-    expect((await stored()).state?.retryCount).toBe(6);
-    await poll();
-    expect(up.eventsNamed("poll_error").at(-1)).toMatchObject({ will_end: "true" });
-    expect(up.eventsNamed("session_ended")[0]).toMatchObject({ reason: "tooManyRetries" });
-    expect(await counts()).toEqual({ sessions: 0, activities: 0, rateLimited: 0 });
+    for (let attempt = 2; attempt <= 10; attempt++) await poll();
+    expect((await stored()).state?.retryCount).toBe(10);
+    expect(up.eventsNamed("poll_error").at(-1)).toMatchObject({ will_end: "false" });
+    expect(up.eventsNamed("session_ended")).toEqual([]);
+    expect(await counts()).toEqual({ sessions: 1, activities: 1, rateLimited: 0 });
   });
 
   it("ends the session at once when Dexcom rejects the credentials", async () => {
@@ -906,7 +919,7 @@ describe("requests landing mid-poll", () => {
     const after = await stored();
     expect(Object.keys(after.tokens)).toEqual(["activity-b"]);
     // The new session's own fresh state, not the old poll's.
-    expect(after.state).toEqual({ sessionStartDate: T0 + seconds(5), pollInterval: 60, retryCount: 0 });
+    expect(after.state).toEqual({ sessionStartDate: T0 + seconds(5), retryCount: 0 });
     expect(after.nextPollAt).toBe(T0 + seconds(5));
     expect(await counts()).toEqual({ sessions: 1, activities: 1, rateLimited: 0 });
   });
@@ -1273,7 +1286,6 @@ describe("logging", () => {
       user: logID,
       message: "Scheduled for 00:03:20 (in 3m 20s)",
       delay_s: "200",
-      poll_interval: "60",
       retry_count: "0",
     });
     expect(up.eventsNamed("push_failed")[0]).toMatchObject({
