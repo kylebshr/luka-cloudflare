@@ -6,7 +6,6 @@ import {
   delayUntilNextReading,
   escalatedRecovery,
   honoredRetryAfter,
-  jittered,
   maxRecoveryInterval,
   maxRetryAfter,
   minInterval,
@@ -23,7 +22,6 @@ import {
   readingInterval,
   readingPropagationBuffer,
   recoveryStartInterval,
-  rescheduleJitterMax,
   staleLevel,
   supersededActivityIDs,
   trimReadings,
@@ -143,14 +141,9 @@ describe("rate limit plan", () => {
   const backoff = { action: "backoff", delay: readingInterval, recovery: recoveryStartInterval };
 
   it("retries once on a short Retry-After, without entering recovery", () => {
-    expect(rateLimitPlan(healthy, limited("17"), now, () => 0)).toEqual({
+    expect(rateLimitPlan(healthy, limited("17"), now)).toEqual({
       action: "quick_retry",
       delay: 17 + quickRetryMargin,
-    });
-    // Jittered, so sessions limited at the same instant don't retry in lockstep.
-    expect(rateLimitPlan(healthy, limited("17"), now, () => 1)).toEqual({
-      action: "quick_retry",
-      delay: 17 + quickRetryMargin + rescheduleJitterMax,
     });
     expect(rateLimitPlan(healthy, limited(String(quickRetryMaxRetryAfter)), now).action).toBe("quick_retry");
   });
@@ -210,14 +203,6 @@ describe("helpers", () => {
     expect(staleLevel(599)).toBe(StaleLevel.warning);
     expect(staleLevel(600)).toBe(StaleLevel.stale);
     expect(staleLevel(900)).toBe(StaleLevel.offline);
-  });
-
-  it("jitters within the configured spread", () => {
-    expect(jittered(60, () => 0)).toBe(60);
-    expect(jittered(60, () => 1)).toBe(60 + rescheduleJitterMax);
-    const value = jittered(60);
-    expect(value).toBeGreaterThanOrEqual(60);
-    expect(value).toBeLessThanOrEqual(60 + rescheduleJitterMax);
   });
 
   it("trims readings to an activity's window", () => {

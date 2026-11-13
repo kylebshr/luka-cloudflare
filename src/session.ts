@@ -30,7 +30,6 @@ import {
   decodingErrorRetryLimit,
   errorBackoff,
   genericErrorRetryLimit,
-  jittered,
   maxInterval,
   maximumDuration,
   minInterval,
@@ -669,8 +668,6 @@ export class UserSession extends DurableObject<Env> {
     await this.#sendStaleUpdatesIfNeeded(cycle, "No new readings");
 
     if ((now - lastReading.date) / 1000 >= readingInterval) {
-      // No jitter: rechecks are phase-anchored to each session's own reading time, so
-      // cohorts don't synchronize.
       const { delay, pollInterval } = overdueReschedule({
         lastReadingDate: lastReading.date,
         now,
@@ -709,7 +706,7 @@ export class UserSession extends DurableObject<Env> {
 
   #rescheduleAfterError(cycle: Cycle): void {
     const { state } = cycle;
-    const delay = jittered(state.pollInterval);
+    const delay = state.pollInterval;
     state.retryCount += 1;
     this.#reschedule(cycle, {
       pollInterval: Math.min(state.pollInterval * errorBackoff, maxInterval),
