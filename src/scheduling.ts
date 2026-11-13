@@ -50,6 +50,15 @@ export const maxRecoveryInterval = 60 * 15;
 // the limit clears, but a malformed or far-future value shouldn't park a session past the
 // point where its Live Activity has any data worth resuming.
 export const maxRetryAfter = 60 * 30;
+// A 429 carrying a `Retry-After` no longer than this gets one quick retry before the long
+// backoff. Production 429s arrive on ordinary boundary polls from sessions already at
+// their minimum rate (one read per 5 minutes), answered by an edge limiter in a few ms
+// with a plain-text body and a `Retry-After` of seconds — a transient limit our polling
+// didn't draw, where waiting out the header costs seconds and the long backoff costs a
+// whole reading.
+export const quickRetryMaxRetryAfter = 60;
+// Added to `Retry-After` on a quick retry so it lands just after the limit clears.
+export const quickRetryMargin = 2;
 // Small random spread added to error reschedules. A cohort synchronized by a shared event
 // (a Dexcom outage erroring many sessions at once) computes its next delay from a shared
 // "now" and would otherwise re-poll in lockstep until fresh readings re-anchor each
@@ -151,6 +160,41 @@ export function honoredRetryAfter(httpResponse: DexcomHTTPResponse | undefined):
 export function escalatedRecovery(current: number | undefined, retryAfter: number): number {
   const doubled = Math.min((current ?? 0) * 2, maxRecoveryInterval);
   return Math.max(recoveryStartInterval, retryAfter, doubled);
+}
+
+/** What to do after a 429: retry once on the server's short `Retry-After`, or back off. */
+export type RateLimitPlan =
+  | { action: "quick_retry"; delay: number }
+  | { action: "backoff"; delay: number; recovery: number };
+
+/**
+ * The scheduling decision for a rate-limited poll. A healthy session whose 429 carries a
+ * short `Retry-After` (at most `quickRetryMaxRetryAfter`) retries once, right after the
+ * header says the limit clears — jittered, since a shared-egress limit hits many sessions
+ * at the same instant — without entering recovery. Everything else backs off: a 429 with
+ * no or a long `Retry-After`, one that arrives while recovering, or one that follows a
+ * quick retry (the header's promise didn't hold). Backing off raises the recovery floor
+ * and aims for a reading boundary at least that far out (never sooner than
+ * `rateLimitMinDelay`), skipping any reading about to land.
+ */
+export function rateLimitPlan(
+  state: Pick<PollState, "recoveryInterval" | "rateLimitRetried" | "lastReading">,
+  httpResponse: DexcomHTTPResponse | undefined,
+  now: number,
+  random: () => number = Math.random,
+): RateLimitPlan {
+  const retryAfter = httpResponse?.retryAfter;
+  if (
+    retryAfter !== undefined &&
+    retryAfter <= quickRetryMaxRetryAfter &&
+    state.recoveryInterval === undefined &&
+    !state.rateLimitRetried
+  ) {
+    return { action: "quick_retry", delay: jittered(retryAfter + quickRetryMargin, random) };
+  }
+  const recovery = escalatedRecovery(state.recoveryInterval, honoredRetryAfter(httpResponse));
+  const delay = delayUntilNextReading(state.lastReading?.date, now, Math.max(rateLimitMinDelay, recovery));
+  return { action: "backoff", delay, recovery };
 }
 
 /**

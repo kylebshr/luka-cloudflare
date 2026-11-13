@@ -102,8 +102,9 @@ is left, the DO deletes all storage.
       upstream request has a timeout (Dexcom and APNs 30s), and a timeout
       fails like a network error.
    3. **Handle the result** per `scheduling.ts`: fan out a new reading; reschedule and
-      send stale milestones (5/10/15 min) when nothing is new; back off on errors (429
-      recovery floor and `Retry-After`, decoding/generic retries with jitter); end the
+      send stale milestones (5/10/15 min) when nothing is new; back off on errors (a 429
+      with a short `Retry-After` gets one quick retry, otherwise the recovery floor;
+      decoding/generic retries with jitter); end the
       activities after too many retries, or at once when Dexcom rejects the credentials
       (retrying a bad password risks locking the user's Dexcom account) — unless a
       registration during the poll changed the password, in which case it re-polls
@@ -216,7 +217,9 @@ repeated there. Secrets are set per environment.
 Workers have no dedicated egress IP. Dexcom Share sits behind Cloudflare, and
 Worker-to-Cloudflare-zone subrequests all present the same shared source address, so
 per-IP rate limiting cannot be managed by spreading load across IPs the way the Fly
-deployment did. Watch the 429 rate on `poll` events (`status_code == "429"`).
+deployment did. Watch the 429 rate on `poll` events (`status_code == "429"`). Each 429's `poll_error` carries
+`rate_limit_action` (`quick_retry` or `backoff`), `retry_after`, `body_prefix`, and
+`response_headers`, which is what distinguishes the edge limiter from Dexcom's own.
 
 ## Tests
 

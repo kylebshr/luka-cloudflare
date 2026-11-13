@@ -356,6 +356,71 @@ describe("rate limits", () => {
     expect(nextPollAt).toBe(r1.date + minutes(15) + seconds(20));
   });
 
+  it("retries once on a short Retry-After, then backs off if that is rate limited too", async () => {
+    await startAndPoll();
+    up.clear();
+    const edgeLimited = () =>
+      new Response("Too many requests.", {
+        status: 429,
+        headers: { "Retry-After": "17", "Set-Cookie": "__cf_bm=secret", "CF-Ray": "abc-SJC" },
+      });
+    up.dexcom.ReadPublisherLatestGlucoseValues = edgeLimited;
+
+    await poll(); // 5m20s after r1
+    const limitedAt = Date.now();
+    expect(up.eventsNamed("poll_error")).toEqual([
+      expect.objectContaining({
+        error_type: "decoding",
+        status_code: "429",
+        retry_after: "17",
+        body_prefix: "Too many requests.",
+        rate_limit_action: "quick_retry",
+        retry_delay_s: "19",
+        recovery_interval: "none",
+      }),
+    ]);
+    const headers = JSON.parse(up.eventsNamed("poll_error")[0]?.response_headers ?? "{}");
+    expect(headers).toMatchObject({ "retry-after": "17", "cf-ray": "abc-SJC" });
+    expect(headers).not.toHaveProperty("set-cookie");
+    let { state, nextPollAt } = await stored();
+    expect(state).toMatchObject({ rateLimitRetried: true, retryCount: 1 });
+    expect(state?.recoveryInterval).toBeUndefined();
+    expect(nextPollAt).toBe(limitedAt + seconds(19));
+    expect(await counts()).toMatchObject({ rateLimited: 0 });
+
+    // The retry is limited as well: the header's promise didn't hold, so back off.
+    await poll();
+    expect(up.eventsNamed("poll_error")[1]).toMatchObject({
+      rate_limit_action: "backoff",
+      recovery_interval: "300",
+    });
+    ({ state, nextPollAt } = await stored());
+    expect(state).toMatchObject({ recoveryInterval: 300, retryCount: 2 });
+    expect(state?.rateLimitRetried).toBeUndefined();
+    expect(nextPollAt).toBe(r1.date + minutes(15) + seconds(20));
+    expect(await counts()).toMatchObject({ rateLimited: 1 });
+  });
+
+  it("picks the reading up on the quick retry and stays out of recovery", async () => {
+    await startAndPoll();
+    up.clear();
+    up.dexcom.ReadPublisherLatestGlucoseValues = () =>
+      new Response("Too many requests.", { status: 429, headers: { "Retry-After": "17" } });
+    await poll();
+
+    delete up.dexcom.ReadPublisherLatestGlucoseValues;
+    const fresh = reading(140, r1.date + minutes(5));
+    up.readings.push(fresh);
+    await poll();
+    const { state, nextPollAt } = await stored();
+    expect(state).toMatchObject({ retryCount: 0, pollInterval: 60 });
+    expect(state?.lastReading).toEqual(fresh);
+    expect(state?.recoveryInterval).toBeUndefined();
+    expect(state?.rateLimitRetried).toBeUndefined();
+    expect(nextPollAt).toBe(fresh.date + minutes(5) + seconds(20));
+    expect(up.eventsNamed("poll_scheduled").at(-1)).toMatchObject({ recovery_interval: "none" });
+  });
+
   it("doesn't let the recovery floor's quick-recheck suppression lapse while it's active", async () => {
     await startAndPoll();
     await runInDurableObject(session(), (_, state) => {

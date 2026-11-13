@@ -72,6 +72,8 @@ export interface PollState {
   lastStaleUpdateMinutes?: number;
   /** Seconds. Present only while easing back from a 429. */
   recoveryInterval?: number;
+  /** Set when a 429 was answered with a quick `Retry-After` retry; cleared by the next healthy poll. */
+  rateLimitRetried?: boolean;
 }
 
 export interface RestartPending {
