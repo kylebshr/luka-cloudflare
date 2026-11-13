@@ -59,12 +59,6 @@ export const maxRetryAfter = 60 * 30;
 export const quickRetryMaxRetryAfter = 60;
 // Added to `Retry-After` on a quick retry so it lands just after the limit clears.
 export const quickRetryMargin = 2;
-// Small random spread added to error reschedules. A cohort synchronized by a shared event
-// (a Dexcom outage erroring many sessions at once) computes its next delay from a shared
-// "now" and would otherwise re-poll in lockstep until fresh readings re-anchor each
-// member. Overdue rechecks don't need it — they're phase-anchored to each session's own
-// reading time.
-export const rescheduleJitterMax = 15;
 
 /**
  * Lifetime of everything a session leaves behind (tombstones, the restart marker). A
@@ -72,14 +66,6 @@ export const rescheduleJitterMax = 15;
  * comfortably exceeds any active session while still letting leftovers expire.
  */
 export const dataTTLSeconds = 8 * 60 * 60;
-
-/**
- * Adds a small random delay so cohorts of sessions rescheduled at the same moment drift
- * apart instead of staying synchronized.
- */
-export function jittered(delay: number, random: () => number = Math.random): number {
-  return delay + random() * rescheduleJitterMax;
-}
 
 /**
  * Delay until the next reading boundary at least `minimumDelay` out, phase-anchored to
@@ -170,8 +156,7 @@ export type RateLimitPlan =
 /**
  * The scheduling decision for a rate-limited poll. A healthy session whose 429 carries a
  * short `Retry-After` (at most `quickRetryMaxRetryAfter`) retries once, right after the
- * header says the limit clears — jittered, since a shared-egress limit hits many sessions
- * at the same instant — without entering recovery. Everything else backs off: a 429 with
+ * header says the limit clears, without entering recovery. Everything else backs off: a 429 with
  * no or a long `Retry-After`, one that arrives while recovering, or one that follows a
  * quick retry (the header's promise didn't hold). Backing off raises the recovery floor
  * and aims for a reading boundary at least that far out (never sooner than
@@ -181,7 +166,6 @@ export function rateLimitPlan(
   state: Pick<PollState, "recoveryInterval" | "rateLimitRetried" | "lastReading">,
   httpResponse: DexcomHTTPResponse | undefined,
   now: number,
-  random: () => number = Math.random,
 ): RateLimitPlan {
   const retryAfter = httpResponse?.retryAfter;
   if (
@@ -190,7 +174,7 @@ export function rateLimitPlan(
     state.recoveryInterval === undefined &&
     !state.rateLimitRetried
   ) {
-    return { action: "quick_retry", delay: jittered(retryAfter + quickRetryMargin, random) };
+    return { action: "quick_retry", delay: retryAfter + quickRetryMargin };
   }
   const recovery = escalatedRecovery(state.recoveryInterval, honoredRetryAfter(httpResponse));
   const delay = delayUntilNextReading(state.lastReading?.date, now, Math.max(rateLimitMinDelay, recovery));

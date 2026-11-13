@@ -31,8 +31,6 @@ let up: Upstreams;
 beforeEach(() => {
   useClock();
   up = new Upstreams();
-  // No reschedule jitter, so error delays are exact.
-  vi.spyOn(Math, "random").mockReturnValue(0);
 });
 
 afterEach(async () => {

@@ -104,7 +104,7 @@ is left, the DO deletes all storage.
    3. **Handle the result** per `scheduling.ts`: fan out a new reading; reschedule and
       send stale milestones (5/10/15 min) when nothing is new; back off on errors (a 429
       with a short `Retry-After` gets one quick retry, otherwise the recovery floor;
-      decoding/generic retries with jitter); end the
+      decoding/generic retries with backoff); end the
       activities after too many retries, or at once when Dexcom rejects the credentials
       (retrying a bad password risks locking the user's Dexcom account) — unless a
       registration during the poll changed the password, in which case it re-polls
