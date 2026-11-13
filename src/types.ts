@@ -66,9 +66,10 @@ export interface PollState {
   lastReading?: GlucoseReading;
   /** Ascending by date, up to 24h. */
   readings?: GlucoseReading[];
-  /** Seconds. */
-  pollInterval: number;
+  /** Consecutive failed polls; any response Dexcom answers with readings clears it. */
   retryCount: number;
+  /** Set while the last poll scheduled a quick recheck for an overdue reading. */
+  rechecking?: boolean;
   lastStaleUpdateMinutes?: number;
   /** Seconds. Present only while easing back from a 429. */
   recoveryInterval?: number;

@@ -104,8 +104,9 @@ is left, the DO deletes all storage.
    3. **Handle the result** per `scheduling.ts`: fan out a new reading; reschedule and
       send stale milestones (5/10/15 min) when nothing is new; back off on errors (a 429
       with a short `Retry-After` gets one quick retry, otherwise the recovery floor;
-      decoding/generic retries with backoff); end the
-      activities after too many retries, or at once when Dexcom rejects the credentials
+      other failures retry a minute apart, then once per reading). Failures never end
+      a session: it keeps retrying until its activities reach their max duration. Only
+      rejected credentials end the activities, at once
       (retrying a bad password risks locking the user's Dexcom account) — unless a
       registration during the poll changed the password, in which case it re-polls
       immediately with the new one.
@@ -177,11 +178,11 @@ characters).
 | `session_start_failed` | error | The start route failed |
 | `tokens_superseded` | log | A new activity replaced its device's older ones |
 | `restart_registered` | log | First registration after a push-to-start restart |
-| `session_ended` | log | `client_end`, `client_end_all`, `all_tokens_expired`, `apns_rejected` (every token dead), `dexcomError`, `tooManyRetries` |
+| `session_ended` | log | `client_end`, `client_end_all`, `all_tokens_expired`, `apns_rejected` (every token dead), `dexcomError` (rejected credentials) |
 | `poll` | log | Every Dexcom poll (`outcome`, `status_code`, `endpoint`, …) |
 | `poll_empty` | warn | Dexcom returned no readings |
 | `poll_error` | warn, or error when `will_end` | A failed poll (`error_type`: `credentials`, `dexcom`, `decoding`, `generic`) |
-| `poll_scheduled` | log | The next poll was set (`delay_s`, `poll_interval`, `retry_count`) |
+| `poll_scheduled` | log | The next poll was set (`delay_s`, `recovery_interval`, `retry_count`) |
 | `push_sent` | log | APNs accepted an update (`kind`: `update` / `stale`) |
 | `push_failed` | error | A push failed (`kind`: `update` / `stale` / `push_to_start`) |
 | `push_ended` | log | An activity was ended at its max duration or by a poll failure |

@@ -24,18 +24,11 @@ import {
 import { type ApnsJwt, reportHeartbeat, type SessionCounts } from "./registry";
 import { redactedEmailLogID } from "./requests";
 import {
-  backoff,
   dataTTLSeconds,
   decayedRecovery,
-  decodingErrorRetryLimit,
-  errorBackoff,
-  genericErrorRetryLimit,
-  maxInterval,
+  errorRetryDelay,
   maximumDuration,
-  minInterval,
-  overduePollCap,
   overdueReschedule,
-  pollFloor,
   type RateLimitPlan,
   rateLimitPlan,
   readingInterval,
@@ -43,6 +36,7 @@ import {
   staleLevel,
   supersededActivityIDs,
   trimReadings,
+  unanchoredPollDelay,
 } from "./scheduling";
 import { apnsKey } from "./secrets";
 import { emit } from "./telemetry";
@@ -80,8 +74,8 @@ const milestoneMinutes: Record<StaleLevel, number> = {
   [StaleLevel.offline]: 15,
 };
 
-/** Why the poll ended the activities. Values are the Vapor server's, which queries use. */
-type EndReason = "dexcomError" | "tooManyRetries";
+/** Why the poll ended the activities. */
+type EndReason = "dexcomError";
 
 class ApnsNotConfiguredError extends Error {
   // The Vapor server's type name, which `push_failed` events carry.
@@ -230,7 +224,6 @@ export class UserSession extends DurableObject<Env> {
           accountID: request.accountID,
           sessionID: request.sessionID,
           sessionStartDate: now,
-          pollInterval: minInterval,
           retryCount: 0,
         });
         kv.put("nextPollAt", now);
@@ -481,7 +474,6 @@ export class UserSession extends DurableObject<Env> {
       user: logID,
       ...pollOutcome(result),
       latency_ms: String(Date.now() - pollStart),
-      poll_interval: String(Math.trunc(state.pollInterval)),
       recovery_active: String(state.recoveryInterval !== undefined),
     });
 
@@ -496,8 +488,10 @@ export class UserSession extends DurableObject<Env> {
 
   async #handlePoll(cycle: Cycle, result: PollResult): Promise<void> {
     const { state, logID, now } = cycle;
+    const retryCount = String(state.retryCount);
 
     if ("readings" in result) {
+      state.retryCount = 0;
       const { readings } = result;
       const latestReading = readings.at(-1);
       const { lastReading } = state;
@@ -508,7 +502,7 @@ export class UserSession extends DurableObject<Env> {
           {
             message: "No readings available",
             user: logID,
-            retry_count: String(state.retryCount),
+            retry_count: retryCount,
             minutes_since_last_reading: minutesSince,
           },
           "warn",
@@ -518,13 +512,8 @@ export class UserSession extends DurableObject<Env> {
           // only already-seen values: the next reading is due and hasn't appeared.
           await this.#rescheduleWithoutNewReading(cycle, lastReading);
         } else {
-          // Nothing to anchor a reading boundary to (fresh sensor, warmup): grow the
-          // spacing toward the reading cadence.
-          this.#reschedule(cycle, {
-            pollInterval: Math.min(state.pollInterval * backoff, overduePollCap(state)),
-            delay: Math.max(state.pollInterval, pollFloor(state)),
-            resetRetries: true,
-          });
+          // Nothing to anchor a reading boundary to (fresh sensor, warmup).
+          this.#reschedule(cycle, { delay: unanchoredPollDelay(state), healthy: true });
         }
         return;
       }
@@ -537,7 +526,6 @@ export class UserSession extends DurableObject<Env> {
     }
 
     const { error } = result;
-    const retryCount = String(state.retryCount);
 
     if (isCredentialError(error) && this.ctx.storage.kv.get<Cred>("cred")?.password !== cycle.password) {
       // A registration during the poll brought a different password: try it right away.
@@ -574,8 +562,7 @@ export class UserSession extends DurableObject<Env> {
     } else if (error instanceof DexcomError && error.httpResponse?.statusCode === 429) {
       // A rate limit whose body decoded as a Dexcom JSON error (app-level limiting, vs.
       // the edge limiter's plain-text and HTML bodies that surface as DexcomDecodingError).
-      // Handle it the same way rather than retrying on the normal cadence and ending
-      // after a few attempts.
+      // Handle it the same way.
       const plan = rateLimitPlan(state, error.httpResponse, Date.now());
       emit(
         "poll_error",
@@ -597,14 +584,11 @@ export class UserSession extends DurableObject<Env> {
       this.#rescheduleAfterRateLimit(cycle, plan);
       await this.#sendStaleUpdatesIfNeeded(cycle, "Rate limited");
     } else if (error instanceof DexcomDecodingError) {
-      const willEnd = state.pollInterval >= maxInterval && state.retryCount > decodingErrorRetryLimit;
-      const ending = willEnd ? ", done retrying, ending all tokens" : "";
-      const plan =
-        error.statusCode === 429 && !willEnd ? rateLimitPlan(state, error.httpResponse, Date.now()) : undefined;
+      const plan = error.statusCode === 429 ? rateLimitPlan(state, error.httpResponse, Date.now()) : undefined;
       emit(
         "poll_error",
         {
-          message: `DexcomDecodingError status: ${error.statusCode}${ending}`,
+          message: `DexcomDecodingError status: ${error.statusCode}`,
           user: logID,
           error_type: "decoding",
           status_code: String(error.statusCode),
@@ -616,18 +600,14 @@ export class UserSession extends DurableObject<Env> {
           ...retryAfterAttributes(error.httpResponse),
           ...(plan && rateLimitAttributes(plan, error.httpResponse)),
           retry_count: retryCount,
-          will_end: String(willEnd),
+          will_end: "false",
           // On a 429, plain text ("Too many requests.") or a Cloudflare HTML error page
           // here means the edge limiter answered; a Dexcom JSON FaultException means
           // app-level limiting.
           body_prefix: error.body.slice(0, 200),
         },
-        willEnd ? "error" : "warn",
+        "warn",
       );
-      if (willEnd) {
-        await this.#endAllTokens(cycle, "tooManyRetries");
-        return;
-      }
       if (plan) {
         this.#rescheduleAfterRateLimit(cycle, plan);
       } else {
@@ -635,23 +615,18 @@ export class UserSession extends DurableObject<Env> {
       }
       await this.#sendStaleUpdatesIfNeeded(cycle, error.statusCode === 429 ? "Rate limited" : "Dexcom error");
     } else {
-      const willEnd = state.pollInterval >= maxInterval && state.retryCount >= genericErrorRetryLimit;
       emit(
         "poll_error",
         {
-          message: `Error polling for session${willEnd ? ", done retrying, ending all tokens" : ""}`,
+          message: "Error polling for session",
           user: logID,
           error_type: "generic",
           error: String(error),
           retry_count: retryCount,
-          will_end: String(willEnd),
+          will_end: "false",
         },
-        willEnd ? "error" : "warn",
+        "warn",
       );
-      if (willEnd) {
-        await this.#endAllTokens(cycle, "tooManyRetries");
-        return;
-      }
       this.#rescheduleAfterError(cycle);
       await this.#sendStaleUpdatesIfNeeded(cycle, "Polling error");
     }
@@ -668,13 +643,13 @@ export class UserSession extends DurableObject<Env> {
     await this.#sendStaleUpdatesIfNeeded(cycle, "No new readings");
 
     if ((now - lastReading.date) / 1000 >= readingInterval) {
-      const { delay, pollInterval } = overdueReschedule({
+      const { delay, rechecking } = overdueReschedule({
         lastReadingDate: lastReading.date,
         now,
-        previousPollInterval: state.pollInterval,
+        rechecking: state.rechecking === true,
         recoveryInterval: state.recoveryInterval,
       });
-      this.#reschedule(cycle, { pollInterval, delay, resetRetries: false });
+      this.#reschedule(cycle, { delay, healthy: false, rechecking });
     } else {
       this.#scheduleForNextReading(cycle, lastReading.date);
     }
@@ -682,7 +657,7 @@ export class UserSession extends DurableObject<Env> {
 
   #scheduleForNextReading(cycle: Cycle, readingDate: number, update?: ReadingUpdate): void {
     const delay = readingInterval - (cycle.now - readingDate) / 1000 + readingPropagationBuffer;
-    this.#reschedule(cycle, { pollInterval: pollFloor(cycle.state), delay, resetRetries: true, update });
+    this.#reschedule(cycle, { delay, healthy: true, update });
   }
 
   /**
@@ -693,7 +668,6 @@ export class UserSession extends DurableObject<Env> {
    */
   #rescheduleAfterRateLimit(cycle: Cycle, plan: RateLimitPlan): void {
     const { state } = cycle;
-    const pollInterval = Math.min(state.pollInterval * errorBackoff, maxInterval);
     if (plan.action === "quick_retry") {
       state.rateLimitRetried = true;
     } else {
@@ -701,42 +675,43 @@ export class UserSession extends DurableObject<Env> {
       delete state.rateLimitRetried;
     }
     state.retryCount += 1;
-    this.#reschedule(cycle, { pollInterval, delay: plan.delay, resetRetries: false });
+    this.#reschedule(cycle, { delay: plan.delay, healthy: false });
   }
 
+  /** After a failed poll that wasn't a rate limit: retry soon at first, then at reading boundaries. */
   #rescheduleAfterError(cycle: Cycle): void {
     const { state } = cycle;
-    const delay = state.pollInterval;
+    const delay = errorRetryDelay(state, Date.now());
     state.retryCount += 1;
-    this.#reschedule(cycle, {
-      pollInterval: Math.min(state.pollInterval * errorBackoff, maxInterval),
-      delay,
-      resetRetries: false,
-    });
+    this.#reschedule(cycle, { delay, healthy: false });
   }
 
   #reschedule(
     cycle: Cycle,
     options: {
-      pollInterval: number;
       /** Seconds from now. */
       delay: number;
-      /** A healthy (non-error) poll: clear the retry count and relax the 429 recovery floor a step. */
-      resetRetries: boolean;
+      /**
+       * The poll found the session on schedule (a new reading, or none due yet): relax the
+       * 429 recovery floor a step and allow a quick 429 retry again.
+       */
+      healthy: boolean;
       update?: ReadingUpdate;
+      /** The next poll is a quick recheck for an overdue reading. */
+      rechecking?: boolean;
     },
   ): void {
     const { state } = cycle;
-    state.pollInterval = options.pollInterval;
     if (options.update) {
       state.lastReading = options.update.reading;
       state.readings = options.update.readings;
     }
-    if (options.resetRetries) {
-      state.retryCount = 0;
+    if (options.healthy) {
       state.recoveryInterval = decayedRecovery(state.recoveryInterval);
       delete state.rateLimitRetried;
     }
+    if (options.rechecking) state.rechecking = true;
+    else delete state.rechecking;
     cycle.nextPollAt = Date.now() + options.delay * 1000;
   }
 
@@ -751,7 +726,6 @@ export class UserSession extends DurableObject<Env> {
       message: `Scheduled for ${time} (in ${Math.floor(delay / 60)}m ${delay % 60}s)`,
       user: cycle.logID,
       delay_s: String(delay),
-      poll_interval: String(Math.trunc(cycle.state.pollInterval)),
       recovery_interval: secondsAttribute(cycle.state.recoveryInterval),
       retry_count: String(cycle.state.retryCount),
     });

@@ -4,27 +4,28 @@ import {
   dataTTLSeconds,
   decayedRecovery,
   delayUntilNextReading,
+  errorQuickRetryLimit,
+  errorRetryDelay,
+  errorRetryInterval,
   escalatedRecovery,
   honoredRetryAfter,
   maxRecoveryInterval,
   maxRetryAfter,
-  minInterval,
   overdueCatchupWindow,
   overdueFirstRetryInterval,
-  overduePollCap,
   overdueReschedule,
   overdueRetryInterval,
-  pollFloor,
   quickRetryMargin,
   quickRetryMaxRetryAfter,
-  rateLimitMinDelay,
   rateLimitPlan,
   readingInterval,
   readingPropagationBuffer,
+  recoveryClearInterval,
   recoveryStartInterval,
   staleLevel,
   supersededActivityIDs,
   trimReadings,
+  unanchoredPollDelay,
 } from "../src/scheduling";
 import { StaleLevel, type TokenEntry } from "../src/types";
 
@@ -34,38 +35,27 @@ const at = (seconds: number) => lastReading + seconds * 1000;
 describe("rate limit rescheduling", () => {
   it("skips to the next reading after a rate limit", () => {
     // Polled 20s after the expected reading and got rate limited: skip the missed reading
-    // and aim for the following one, ~5 min out.
-    const overdueDelay = delayUntilNextReading(lastReading, at(readingInterval + 20), rateLimitMinDelay);
-    expect(overdueDelay).toBeGreaterThanOrEqual(280);
-    expect(overdueDelay).toBeLessThanOrEqual(320);
+    // and aim for the following one, 5 min out.
+    expect(delayUntilNextReading(lastReading, at(readingInterval + 20), recoveryStartInterval)).toBe(300);
 
-    // Rate limited 40s *before* a reading is due: don't aim for that imminent reading (it'd
-    // just re-trigger the 429) — skip it and land on the following one.
-    const beforeDueDelay = delayUntilNextReading(lastReading, at(readingInterval - 40), rateLimitMinDelay);
-    expect(beforeDueDelay).toBeGreaterThanOrEqual(rateLimitMinDelay);
-    expect(beforeDueDelay).toBeGreaterThanOrEqual(340); // ~6 min: 40s to the skipped reading + 5m + buffer
-    expect(beforeDueDelay).toBeLessThanOrEqual(380);
+    // Rate limited 40s *before* a reading is due: don't aim for that imminent reading —
+    // skip it and land on the following one (40s + 5m + the buffer).
+    expect(delayUntilNextReading(lastReading, at(readingInterval - 40), recoveryStartInterval)).toBe(360);
 
     // With no prior reading to anchor to, fall back to at least the floor.
-    expect(delayUntilNextReading(undefined, at(readingInterval + 20), rateLimitMinDelay)).toBeGreaterThanOrEqual(
-      rateLimitMinDelay,
-    );
+    expect(delayUntilNextReading(undefined, at(readingInterval + 20), 600)).toBe(600);
     expect(delayUntilNextReading(undefined, 0)).toBe(readingInterval + readingPropagationBuffer);
   });
 
   it("extends the floor with Retry-After", () => {
-    // Dexcom asked for a 10-minute wait — longer than rateLimitMinDelay, so the header
+    // Dexcom asked for a 10-minute wait — longer than the recovery floor, so the header
     // wins and the reschedule lands on the first reading boundary past it.
     const retryAfter = honoredRetryAfter(new DexcomHTTPResponse(429, undefined, { "Retry-After": "600" }));
     expect(retryAfter).toBe(600);
 
-    const delay = delayUntilNextReading(lastReading, at(readingInterval + 20), Math.max(rateLimitMinDelay, retryAfter));
+    const delay = delayUntilNextReading(lastReading, at(readingInterval + 20), retryAfter);
     expect(delay).toBeGreaterThanOrEqual(600);
     expect(delay).toBeLessThanOrEqual(600 + readingInterval);
-
-    // A shorter Retry-After than our own floor doesn't shrink the backoff.
-    const short = honoredRetryAfter(new DexcomHTTPResponse(429, undefined, { "Retry-After": "30" }));
-    expect(Math.max(rateLimitMinDelay, short)).toBe(rateLimitMinDelay);
   });
 
   it("caps Retry-After and falls back to 0", () => {
@@ -80,56 +70,73 @@ describe("rate limit rescheduling", () => {
 });
 
 describe("overdueReschedule", () => {
-  /** A last reading `offset` seconds in the past; `previous` defaults to a boundary poll's spacing. */
-  const overdue = (offset: number, previous = minInterval, recovery?: number) =>
+  /** A last reading `offset` seconds in the past, found overdue by a boundary poll unless `rechecking`. */
+  const overdue = (offset: number, rechecking = false, recovery?: number) =>
     overdueReschedule({
       lastReadingDate: lastReading,
       now: at(offset),
-      previousPollInterval: previous,
+      rechecking,
       recoveryInterval: recovery,
     });
 
   it("rechecks quickly through the catch-up window", () => {
     // The boundary poll just missed: the first recheck is extra quick.
     const first = overdue(readingInterval + readingPropagationBuffer);
-    expect(first).toEqual({ delay: overdueFirstRetryInterval, pollInterval: overdueFirstRetryInterval });
+    expect(first).toEqual({ delay: overdueFirstRetryInterval, rechecking: true });
 
-    // A poll scheduled by a catch-up recheck: the standard cadence from here on.
-    const second = overdue(
-      readingInterval + readingPropagationBuffer + overdueFirstRetryInterval,
-      overdueFirstRetryInterval,
-    );
-    expect(second.delay).toBe(overdueRetryInterval);
+    // A poll that was itself a recheck: the standard cadence from here on.
+    const second = overdue(readingInterval + readingPropagationBuffer + overdueFirstRetryInterval, true);
+    expect(second).toEqual({ delay: overdueRetryInterval, rechecking: true });
 
     // Still inside the window a hair before it closes: same standard cadence.
-    const late = overdue(readingInterval + overdueCatchupWindow - 1, overdueRetryInterval);
+    const late = overdue(readingInterval + overdueCatchupWindow - 1, true);
     expect(late.delay).toBe(overdueRetryInterval);
   });
 
   it("anchors to reading boundaries past the catch-up window", () => {
     // 7.5 minutes since the last reading: aim for the 10:00 boundary plus the buffer.
-    expect(overdue(450)).toEqual({ delay: 150 + readingPropagationBuffer, pollInterval: readingInterval });
+    expect(overdue(450, true)).toEqual({ delay: 150 + readingPropagationBuffer, rechecking: false });
 
     // Deep in a gap, a boundary+buffer poll lands on the next boundary+buffer.
     expect(overdue(10 * readingInterval + readingPropagationBuffer)).toEqual({
       delay: readingInterval,
-      pollInterval: readingInterval,
+      rechecking: false,
     });
   });
 
   it("disables the quick cadence during post-429 recovery", () => {
     // Inside the catch-up window but recovering: aim for the next boundary at least the
     // recovery floor away.
-    expect(overdue(readingInterval + 20, minInterval, recoveryStartInterval)).toEqual({
+    expect(overdue(readingInterval + 20, false, recoveryStartInterval)).toEqual({
       delay: 280 + readingPropagationBuffer,
-      pollInterval: readingInterval,
+      rechecking: false,
     });
 
     // Even a mostly-decayed floor suppresses the quick cadence.
-    expect(overdue(readingInterval + 50, overdueRetryInterval, 120).delay).toBe(250 + readingPropagationBuffer);
+    expect(overdue(readingInterval + 50, true, 120).delay).toBe(250 + readingPropagationBuffer);
 
     // Past the window, a boundary sooner than the floor is skipped for the next one.
-    expect(overdue(450, minInterval, 240).delay).toBe(450 + readingPropagationBuffer); // 15:00, not 10:00
+    expect(overdue(450, false, 240).delay).toBe(450 + readingPropagationBuffer); // 15:00, not 10:00
+  });
+});
+
+describe("error retries", () => {
+  const anchored = { lastReading: { value: 100, trend: "Flat" as const, date: lastReading } };
+  const now = at(readingInterval + readingPropagationBuffer);
+
+  it("retries quickly at first, then only at reading boundaries", () => {
+    expect(errorRetryDelay({ ...anchored, retryCount: 0 }, now)).toBe(errorRetryInterval);
+    expect(errorRetryDelay({ ...anchored, retryCount: errorQuickRetryLimit - 1 }, now)).toBe(errorRetryInterval);
+    // A sustained outage: one poll per reading, landing just after each boundary.
+    expect(errorRetryDelay({ ...anchored, retryCount: errorQuickRetryLimit }, now)).toBe(readingInterval);
+    expect(errorRetryDelay({ ...anchored, retryCount: 50 }, at(readingInterval + 200))).toBe(120);
+    // Never had a reading: the reading cadence.
+    expect(errorRetryDelay({ retryCount: errorQuickRetryLimit }, now)).toBe(readingInterval + readingPropagationBuffer);
+  });
+
+  it("never retries sooner than an active recovery floor", () => {
+    expect(errorRetryDelay({ ...anchored, retryCount: 0, recoveryInterval: 180 }, now)).toBe(180);
+    expect(errorRetryDelay({ ...anchored, retryCount: errorQuickRetryLimit, recoveryInterval: 600 }, now)).toBe(600);
   });
 });
 
@@ -178,21 +185,19 @@ describe("recovery floor", () => {
     expect(escalatedRecovery(300, 1200)).toBe(1200);
   });
 
-  it("decays toward minInterval then clears", () => {
+  it("decays toward recoveryClearInterval then clears", () => {
     let floor = decayedRecovery(recoveryStartInterval);
     expect(floor).toBe(300 * 0.6); // 180
     floor = decayedRecovery(floor); // 108
     floor = decayedRecovery(floor); // 64.8
-    expect(floor).toBeGreaterThan(minInterval);
+    expect(floor).toBeGreaterThan(recoveryClearInterval);
     expect(decayedRecovery(floor)).toBeUndefined(); // 38.88 -> cleared
     expect(decayedRecovery(undefined)).toBeUndefined();
   });
 
-  it("raises the poll floor and cap while recovering", () => {
-    expect(pollFloor({})).toBe(minInterval);
-    expect(pollFloor({ recoveryInterval: 180 })).toBe(180);
-    expect(overduePollCap({})).toBe(readingInterval);
-    expect(overduePollCap({ recoveryInterval: 600 })).toBe(600);
+  it("spaces polls for a session with no reading by the recovery floor", () => {
+    expect(unanchoredPollDelay({})).toBe(readingInterval);
+    expect(unanchoredPollDelay({ recoveryInterval: 600 })).toBe(600);
   });
 });
 
