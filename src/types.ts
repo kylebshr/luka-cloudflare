@@ -73,7 +73,7 @@ export interface PollState {
   lastStaleUpdateMinutes?: number;
   /** Seconds. Present only while easing back from a 429. */
   recoveryInterval?: number;
-  /** Set when a 429 was answered with a quick `Retry-After` retry; cleared by the next healthy poll. */
+  /** Set when a 429 was answered with a quick `Retry-After` retry; cleared by the next response Dexcom answers with readings. */
   rateLimitRetried?: boolean;
 }
 
