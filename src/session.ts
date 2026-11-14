@@ -491,7 +491,10 @@ export class UserSession extends DurableObject<Env> {
     const retryCount = String(state.retryCount);
 
     if ("readings" in result) {
+      // Dexcom answered: the failure streak is over and a later 429 may quick-retry again,
+      // whether or not this response carried a new reading.
       state.retryCount = 0;
+      delete state.rateLimitRetried;
       const { readings } = result;
       const latestReading = readings.at(-1);
       const { lastReading } = state;
@@ -693,7 +696,7 @@ export class UserSession extends DurableObject<Env> {
       delay: number;
       /**
        * The poll found the session on schedule (a new reading, or none due yet): relax the
-       * 429 recovery floor a step and allow a quick 429 retry again.
+       * 429 recovery floor a step.
        */
       healthy: boolean;
       update?: ReadingUpdate;
@@ -708,7 +711,6 @@ export class UserSession extends DurableObject<Env> {
     }
     if (options.healthy) {
       state.recoveryInterval = decayedRecovery(state.recoveryInterval);
-      delete state.rateLimitRetried;
     }
     if (options.rechecking) state.rechecking = true;
     else delete state.rechecking;
