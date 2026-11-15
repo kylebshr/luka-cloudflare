@@ -491,10 +491,9 @@ export class UserSession extends DurableObject<Env> {
     const retryCount = String(state.retryCount);
 
     if ("readings" in result) {
-      // Dexcom answered: the failure streak is over and a later 429 may quick-retry again,
-      // whether or not this response carried a new reading.
+      // Dexcom answered: the failure streak is over, whether or not this response carried a
+      // new reading.
       state.retryCount = 0;
-      delete state.rateLimitRetried;
       const { readings } = result;
       const latestReading = readings.at(-1);
       const { lastReading } = state;
@@ -664,19 +663,14 @@ export class UserSession extends DurableObject<Env> {
   }
 
   /**
-   * After a 429, applies the `rateLimitPlan`: either one quick retry on the server's short
-   * `Retry-After`, leaving the session out of recovery, or a backoff to a reading boundary
-   * at least the recovery floor out. Once the limit clears, the floor eases polling back
-   * in instead of resuming the aggressive overdue cadence.
+   * After a 429, applies the `rateLimitPlan`: either a quick retry on the server's short
+   * `Retry-After`, leaving the recovery floor untouched, or a backoff to a reading boundary
+   * at least the raised recovery floor out. Once the limit clears, the floor eases polling
+   * back in instead of resuming the aggressive overdue cadence.
    */
   #rescheduleAfterRateLimit(cycle: Cycle, plan: RateLimitPlan): void {
     const { state } = cycle;
-    if (plan.action === "quick_retry") {
-      state.rateLimitRetried = true;
-    } else {
-      state.recoveryInterval = plan.recovery;
-      delete state.rateLimitRetried;
-    }
+    if (plan.action === "backoff") state.recoveryInterval = plan.recovery;
     state.retryCount += 1;
     this.#reschedule(cycle, { delay: plan.delay, healthy: false });
   }

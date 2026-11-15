@@ -46,12 +46,15 @@ export const maxRecoveryInterval = 60 * 15;
 // the limit clears, but a malformed or far-future value shouldn't park a session past the
 // point where its Live Activity has any data worth resuming.
 export const maxRetryAfter = 60 * 30;
-// A 429 carrying a `Retry-After` no longer than this gets one quick retry before the long
-// backoff. Production 429s arrive on ordinary boundary polls from sessions already at
-// their minimum rate (one read per 5 minutes), answered by an edge limiter in a few ms
-// with a plain-text body and a `Retry-After` of seconds — a transient limit our polling
-// didn't draw, where waiting out the header costs seconds and the long backoff costs a
-// whole reading.
+// A 429 carrying a `Retry-After` no longer than this is retried as soon as the header
+// allows, however many times in a row, instead of backing off. Production 429s arrive on
+// ordinary boundary polls from sessions already at their minimum rate (one read per 5
+// minutes), answered by an edge limiter in a few ms with a plain-text body and a
+// `Retry-After` of seconds: a limit on the source address Workers share, which our
+// polling didn't draw and which slower polling doesn't lift. In a busy data center it
+// blocks close to half of all requests, so a session that backs off after a limited
+// retry can keep landing in a block and go without data for its whole lifetime, while
+// following the header gets it a reading within a minute or two.
 export const quickRetryMaxRetryAfter = 60;
 // Added to `Retry-After` on a quick retry so it lands just after the limit clears.
 export const quickRetryMargin = 2;
@@ -153,32 +156,25 @@ export function escalatedRecovery(current: number | undefined, retryAfter: numbe
   return Math.max(recoveryStartInterval, retryAfter, doubled);
 }
 
-/** What to do after a 429: retry once on the server's short `Retry-After`, or back off. */
+/** What to do after a 429: retry on the server's short `Retry-After`, or back off. */
 export type RateLimitPlan =
   | { action: "quick_retry"; delay: number }
   | { action: "backoff"; delay: number; recovery: number };
 
 /**
- * The scheduling decision for a rate-limited poll. A healthy session whose 429 carries a
- * short `Retry-After` (at most `quickRetryMaxRetryAfter`) retries once, right after the
- * header says the limit clears, without entering recovery. Everything else backs off: a 429 with
- * no or a long `Retry-After`, one that arrives while recovering, or one that follows a
- * quick retry (the header's promise didn't hold). Backing off raises the recovery floor
- * and aims for a reading boundary at least that far out, skipping any reading about to
- * land.
+ * The scheduling decision for a rate-limited poll. A 429 carrying a short `Retry-After`
+ * (at most `quickRetryMaxRetryAfter`) retries right after the header says the limit
+ * clears, leaving the recovery floor as it was. A 429 with no or a long `Retry-After`
+ * backs off: it raises the recovery floor and aims for a reading boundary at least that
+ * far out, skipping any reading about to land.
  */
 export function rateLimitPlan(
-  state: Pick<PollState, "recoveryInterval" | "rateLimitRetried" | "lastReading">,
+  state: Pick<PollState, "recoveryInterval" | "lastReading">,
   httpResponse: DexcomHTTPResponse | undefined,
   now: number,
 ): RateLimitPlan {
   const retryAfter = httpResponse?.retryAfter;
-  if (
-    retryAfter !== undefined &&
-    retryAfter <= quickRetryMaxRetryAfter &&
-    state.recoveryInterval === undefined &&
-    !state.rateLimitRetried
-  ) {
+  if (retryAfter !== undefined && retryAfter <= quickRetryMaxRetryAfter) {
     return { action: "quick_retry", delay: retryAfter + quickRetryMargin };
   }
   const recovery = escalatedRecovery(state.recoveryInterval, honoredRetryAfter(httpResponse));

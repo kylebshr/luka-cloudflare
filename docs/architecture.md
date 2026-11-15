@@ -103,7 +103,8 @@ is left, the DO deletes all storage.
       fails like a network error.
    3. **Handle the result** per `scheduling.ts`: fan out a new reading; reschedule and
       send stale milestones (5/10/15 min) when nothing is new; back off on errors (a 429
-      with a short `Retry-After` gets one quick retry, otherwise the recovery floor;
+      with a short `Retry-After` is retried as soon as the header allows, otherwise the
+      recovery floor;
       other failures retry a minute apart, then once per reading). Failures never end
       a session: it keeps retrying until its activities reach their max duration. Only
       rejected credentials end the activities, at once
