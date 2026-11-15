@@ -147,7 +147,7 @@ describe("rate limit plan", () => {
   const now = at(readingInterval + readingPropagationBuffer);
   const backoff = { action: "backoff", delay: readingInterval, recovery: recoveryStartInterval };
 
-  it("retries once on a short Retry-After, without entering recovery", () => {
+  it("retries on a short Retry-After, without entering recovery", () => {
     expect(rateLimitPlan(healthy, limited("17"), now)).toEqual({
       action: "quick_retry",
       delay: 17 + quickRetryMargin,
@@ -162,12 +162,15 @@ describe("rate limit plan", () => {
     expect(rateLimitPlan(healthy, limited(String(quickRetryMaxRetryAfter + 1)), now)).toEqual(backoff);
   });
 
-  it("backs off when the quick retry was rate limited too", () => {
-    expect(rateLimitPlan({ ...healthy, rateLimitRetried: true }, limited("17"), now)).toEqual(backoff);
+  it("retries on a short Retry-After even while recovering", () => {
+    expect(rateLimitPlan({ ...healthy, recoveryInterval: 300 }, limited("17"), now)).toEqual({
+      action: "quick_retry",
+      delay: 17 + quickRetryMargin,
+    });
   });
 
-  it("escalates instead of retrying while recovering", () => {
-    expect(rateLimitPlan({ ...healthy, recoveryInterval: 300 }, limited("17"), now)).toEqual({
+  it("escalates the recovery floor on a repeated 429 without a short Retry-After", () => {
+    expect(rateLimitPlan({ ...healthy, recoveryInterval: 300 }, limited(), now)).toEqual({
       action: "backoff",
       delay: 2 * readingInterval,
       recovery: 600,

@@ -345,7 +345,7 @@ describe("rate limits", () => {
     expect(nextPollAt).toBe(r1.date + minutes(15) + seconds(20));
   });
 
-  it("retries once on a short Retry-After, then backs off if that is rate limited too", async () => {
+  it("keeps retrying on a short Retry-After for as long as the retries are rate limited", async () => {
     await startAndPoll();
     up.clear();
     const edgeLimited = () =>
@@ -372,22 +372,25 @@ describe("rate limits", () => {
     expect(headers).toMatchObject({ "retry-after": "17", "cf-ray": "abc-SJC" });
     expect(headers).not.toHaveProperty("set-cookie");
     let { state, nextPollAt } = await stored();
-    expect(state).toMatchObject({ rateLimitRetried: true, retryCount: 1 });
+    expect(state).toMatchObject({ retryCount: 1 });
     expect(state?.recoveryInterval).toBeUndefined();
     expect(nextPollAt).toBe(limitedAt + seconds(19));
     expect(await counts()).toMatchObject({ rateLimited: 0 });
 
-    // The retry is limited as well: the header's promise didn't hold, so back off.
-    await poll();
-    expect(up.eventsNamed("poll_error")[1]).toMatchObject({
-      rate_limit_action: "backoff",
-      recovery_interval: "300",
-    });
-    ({ state, nextPollAt } = await stored());
-    expect(state).toMatchObject({ recoveryInterval: 300, retryCount: 2 });
-    expect(state?.rateLimitRetried).toBeUndefined();
-    expect(nextPollAt).toBe(r1.date + minutes(15) + seconds(20));
-    expect(await counts()).toMatchObject({ rateLimited: 1 });
+    // The retries are limited as well: each one follows the header again, never the backoff.
+    for (let attempt = 2; attempt <= 6; attempt++) {
+      await poll();
+      expect(up.eventsNamed("poll_error").at(-1)).toMatchObject({
+        rate_limit_action: "quick_retry",
+        recovery_interval: "none",
+        retry_count: String(attempt - 1),
+      });
+      ({ state, nextPollAt } = await stored());
+      expect(state).toMatchObject({ retryCount: attempt });
+      expect(state?.recoveryInterval).toBeUndefined();
+      expect(nextPollAt).toBe(Date.now() + seconds(19));
+    }
+    expect(await counts()).toMatchObject({ rateLimited: 0 });
   });
 
   it("picks the reading up on the quick retry and stays out of recovery", async () => {
@@ -405,12 +408,11 @@ describe("rate limits", () => {
     expect(state).toMatchObject({ retryCount: 0 });
     expect(state?.lastReading).toEqual(fresh);
     expect(state?.recoveryInterval).toBeUndefined();
-    expect(state?.rateLimitRetried).toBeUndefined();
     expect(nextPollAt).toBe(fresh.date + minutes(5) + seconds(20));
     expect(up.eventsNamed("poll_scheduled").at(-1)).toMatchObject({ recovery_interval: "none" });
   });
 
-  it("allows another quick retry after one that found no new reading", async () => {
+  it("quick-retries a 429 during a sensor gap", async () => {
     await startAndPoll();
     up.clear();
     const edgeLimited = () => new Response("Too many requests.", { status: 429, headers: { "Retry-After": "17" } });
@@ -420,7 +422,6 @@ describe("rate limits", () => {
     // The retry is answered, but the sensor has nothing new: the reading stays overdue.
     delete up.dexcom.ReadPublisherLatestGlucoseValues;
     await poll();
-    expect((await stored()).state?.rateLimitRetried).toBeUndefined();
 
     // A later 429 in the same gap gets its own quick retry rather than the long backoff.
     up.dexcom.ReadPublisherLatestGlucoseValues = edgeLimited;
