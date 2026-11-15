@@ -31,10 +31,11 @@ export const maximumDuration = 60 * 60 * 7;
 // activities reach their max duration. Only rejected credentials end it early.
 export const errorRetryInterval = 60;
 export const errorQuickRetryLimit = 5;
-// After a rate limit (429), poll no more often than this at first, then ease back
-// (recoveryInterval shrinks to recoveryDecay of itself on each healthy poll, and clears
-// once it reaches recoveryClearInterval) rather than immediately resuming the aggressive
-// overdue cadence. Repeated 429s double the floor instead — see escalatedRecovery.
+// After a 429 that says nothing about when to come back, poll no more often than this at
+// first, then ease back (recoveryInterval shrinks to recoveryDecay of itself on each
+// healthy poll, and clears once it reaches recoveryClearInterval) rather than immediately
+// resuming the aggressive overdue cadence. Repeated 429s double the floor instead — see
+// escalatedRecovery.
 export const recoveryStartInterval = 300;
 export const recoveryDecay = 0.6;
 export const recoveryClearInterval = 60;
@@ -46,18 +47,8 @@ export const maxRecoveryInterval = 60 * 15;
 // the limit clears, but a malformed or far-future value shouldn't park a session past the
 // point where its Live Activity has any data worth resuming.
 export const maxRetryAfter = 60 * 30;
-// A 429 carrying a `Retry-After` no longer than this is retried as soon as the header
-// allows, however many times in a row, instead of backing off. Production 429s arrive on
-// ordinary boundary polls from sessions already at their minimum rate (one read per 5
-// minutes), answered by an edge limiter in a few ms with a plain-text body and a
-// `Retry-After` of seconds: a limit on the source address Workers share, which our
-// polling didn't draw and which slower polling doesn't lift. In a busy data center it
-// blocks close to half of all requests, so a session that backs off after a limited
-// retry can keep landing in a block and go without data for its whole lifetime, while
-// following the header gets it a reading within a minute or two.
-export const quickRetryMaxRetryAfter = 60;
-// Added to `Retry-After` on a quick retry so it lands just after the limit clears.
-export const quickRetryMargin = 2;
+// Added to `Retry-After` so the retry lands just after the limit clears.
+export const retryAfterMargin = 2;
 
 /**
  * Lifetime of everything a session leaves behind (tombstones, the restart marker). A
@@ -135,49 +126,58 @@ export function errorRetryDelay(
 
 /**
  * The `Retry-After` delay to honor from a rate-limited response, capped at
- * `maxRetryAfter`. Returns 0 when the response carried no usable header, so callers can
- * take `max` with their own floors.
+ * `maxRetryAfter`. Undefined when the response gives nothing to follow: no header, an
+ * unparseable one, or one that names no time in the future.
  */
-export function honoredRetryAfter(httpResponse: DexcomHTTPResponse | undefined): number {
-  return Math.min(httpResponse?.retryAfter ?? 0, maxRetryAfter);
+export function honoredRetryAfter(httpResponse: DexcomHTTPResponse | undefined): number | undefined {
+  const retryAfter = httpResponse?.retryAfter;
+  if (retryAfter === undefined || retryAfter <= 0) return undefined;
+  return Math.min(retryAfter, maxRetryAfter);
 }
 
 /**
- * The post-429 recovery floor after a rate-limited response. The first 429 starts at
- * `recoveryStartInterval`; a 429 arriving while a floor is already active means the
- * account's budget is still exhausted at the current spacing (Dexcom's limiter refills at
- * roughly the reading cadence, so a drained budget can't absorb even boundary polls), so
- * the floor doubles — capped at `maxRecoveryInterval`, where polls skip 1–2 reading
- * boundaries and the budget rebuilds. A server-provided `Retry-After` longer than all of
- * that wins outright.
+ * The post-429 recovery floor after a rate-limited response that carried no usable
+ * `Retry-After`. The first 429 starts at `recoveryStartInterval`; a 429 arriving while a
+ * floor is already active means the account's budget is still exhausted at the current
+ * spacing (Dexcom's limiter refills at roughly the reading cadence, so a drained budget
+ * can't absorb even boundary polls), so the floor doubles — capped at
+ * `maxRecoveryInterval`, where polls skip 1–2 reading boundaries and the budget rebuilds.
  */
-export function escalatedRecovery(current: number | undefined, retryAfter: number): number {
+export function escalatedRecovery(current: number | undefined): number {
   const doubled = Math.min((current ?? 0) * 2, maxRecoveryInterval);
-  return Math.max(recoveryStartInterval, retryAfter, doubled);
+  return Math.max(recoveryStartInterval, doubled);
 }
 
-/** What to do after a 429: retry on the server's short `Retry-After`, or back off. */
+/** What to do after a 429: retry when the server's `Retry-After` allows, or back off. */
 export type RateLimitPlan =
-  | { action: "quick_retry"; delay: number }
+  | { action: "retry_after"; delay: number }
   | { action: "backoff"; delay: number; recovery: number };
 
 /**
- * The scheduling decision for a rate-limited poll. A 429 carrying a short `Retry-After`
- * (at most `quickRetryMaxRetryAfter`) retries right after the header says the limit
- * clears, leaving the recovery floor as it was. A 429 with no or a long `Retry-After`
- * backs off: it raises the recovery floor and aims for a reading boundary at least that
- * far out, skipping any reading about to land.
+ * The scheduling decision for a rate-limited poll. A 429 that carries a usable
+ * `Retry-After` is retried right after the header says the limit clears, however many
+ * times in a row, leaving the recovery floor as it was. Production 429s arrive on
+ * ordinary boundary polls from sessions already at their minimum rate (one read per 5
+ * minutes), answered by an edge limiter in a few ms with a plain-text body and a
+ * `Retry-After` of seconds: a limit on the source address Workers share, which our
+ * polling didn't draw and which slower polling doesn't lift. In a busy data center it
+ * blocks close to half of all requests, so a session that backs off can keep landing in
+ * a block and go without data for its whole lifetime, while following the header gets it
+ * a reading within a minute or two.
+ *
+ * A 429 without a usable header backs off: it raises the recovery floor and aims for a
+ * reading boundary at least that far out, skipping any reading about to land.
  */
 export function rateLimitPlan(
   state: Pick<PollState, "recoveryInterval" | "lastReading">,
   httpResponse: DexcomHTTPResponse | undefined,
   now: number,
 ): RateLimitPlan {
-  const retryAfter = httpResponse?.retryAfter;
-  if (retryAfter !== undefined && retryAfter <= quickRetryMaxRetryAfter) {
-    return { action: "quick_retry", delay: retryAfter + quickRetryMargin };
+  const retryAfter = honoredRetryAfter(httpResponse);
+  if (retryAfter !== undefined) {
+    return { action: "retry_after", delay: retryAfter + retryAfterMargin };
   }
-  const recovery = escalatedRecovery(state.recoveryInterval, honoredRetryAfter(httpResponse));
+  const recovery = escalatedRecovery(state.recoveryInterval);
   const delay = delayUntilNextReading(state.lastReading?.date, now, recovery);
   return { action: "backoff", delay, recovery };
 }

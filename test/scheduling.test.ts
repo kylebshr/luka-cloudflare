@@ -15,13 +15,12 @@ import {
   overdueFirstRetryInterval,
   overdueReschedule,
   overdueRetryInterval,
-  quickRetryMargin,
-  quickRetryMaxRetryAfter,
   rateLimitPlan,
   readingInterval,
   readingPropagationBuffer,
   recoveryClearInterval,
   recoveryStartInterval,
+  retryAfterMargin,
   staleLevel,
   supersededActivityIDs,
   trimReadings,
@@ -47,25 +46,19 @@ describe("rate limit rescheduling", () => {
     expect(delayUntilNextReading(undefined, 0)).toBe(readingInterval + readingPropagationBuffer);
   });
 
-  it("extends the floor with Retry-After", () => {
-    // Dexcom asked for a 10-minute wait — longer than the recovery floor, so the header
-    // wins and the reschedule lands on the first reading boundary past it.
-    const retryAfter = honoredRetryAfter(new DexcomHTTPResponse(429, undefined, { "Retry-After": "600" }));
-    expect(retryAfter).toBe(600);
-
-    const delay = delayUntilNextReading(lastReading, at(readingInterval + 20), retryAfter);
-    expect(delay).toBeGreaterThanOrEqual(600);
-    expect(delay).toBeLessThanOrEqual(600 + readingInterval);
-  });
-
-  it("caps Retry-After and falls back to 0", () => {
+  it("caps Retry-After and ignores one that gives nothing to follow", () => {
+    const honored = (value?: string) =>
+      honoredRetryAfter(new DexcomHTTPResponse(429, undefined, value === undefined ? {} : { "Retry-After": value }));
+    expect(honored("600")).toBe(600);
     // A far-future value can't park a session for hours.
-    expect(honoredRetryAfter(new DexcomHTTPResponse(429, undefined, { "Retry-After": "86400" }))).toBe(maxRetryAfter);
+    expect(honored("86400")).toBe(maxRetryAfter);
 
-    // No header, unparseable header, or no response at all: contribute nothing.
-    expect(honoredRetryAfter(new DexcomHTTPResponse(429))).toBe(0);
-    expect(honoredRetryAfter(new DexcomHTTPResponse(429, undefined, { "Retry-After": "soon" }))).toBe(0);
-    expect(honoredRetryAfter(undefined)).toBe(0);
+    // No header, an unparseable one, no time in the future, or no response at all.
+    expect(honored()).toBeUndefined();
+    expect(honored("soon")).toBeUndefined();
+    expect(honored("0")).toBeUndefined();
+    expect(honored("Wed, 21 Oct 2015 07:28:00 GMT")).toBeUndefined();
+    expect(honoredRetryAfter(undefined)).toBeUndefined();
   });
 });
 
@@ -147,29 +140,33 @@ describe("rate limit plan", () => {
   const now = at(readingInterval + readingPropagationBuffer);
   const backoff = { action: "backoff", delay: readingInterval, recovery: recoveryStartInterval };
 
-  it("retries on a short Retry-After, without entering recovery", () => {
-    expect(rateLimitPlan(healthy, limited("17"), now)).toEqual({
-      action: "quick_retry",
-      delay: 17 + quickRetryMargin,
+  it("retries when Retry-After allows, without entering recovery", () => {
+    expect(rateLimitPlan(healthy, limited("17"), now)).toEqual({ action: "retry_after", delay: 17 + retryAfterMargin });
+    expect(rateLimitPlan(healthy, limited("600"), now)).toEqual({
+      action: "retry_after",
+      delay: 600 + retryAfterMargin,
     });
-    expect(rateLimitPlan(healthy, limited(String(quickRetryMaxRetryAfter)), now).action).toBe("quick_retry");
+    expect(rateLimitPlan(healthy, limited("86400"), now)).toEqual({
+      action: "retry_after",
+      delay: maxRetryAfter + retryAfterMargin,
+    });
   });
 
-  it("backs off without a usable or short Retry-After", () => {
+  it("follows Retry-After even while recovering", () => {
+    expect(rateLimitPlan({ ...healthy, recoveryInterval: 300 }, limited("17"), now)).toEqual({
+      action: "retry_after",
+      delay: 17 + retryAfterMargin,
+    });
+  });
+
+  it("backs off without a usable Retry-After", () => {
     expect(rateLimitPlan(healthy, limited(), now)).toEqual(backoff);
     expect(rateLimitPlan(healthy, undefined, now)).toEqual(backoff);
     expect(rateLimitPlan(healthy, limited("soon"), now)).toEqual(backoff);
-    expect(rateLimitPlan(healthy, limited(String(quickRetryMaxRetryAfter + 1)), now)).toEqual(backoff);
+    expect(rateLimitPlan(healthy, limited("0"), now)).toEqual(backoff);
   });
 
-  it("retries on a short Retry-After even while recovering", () => {
-    expect(rateLimitPlan({ ...healthy, recoveryInterval: 300 }, limited("17"), now)).toEqual({
-      action: "quick_retry",
-      delay: 17 + quickRetryMargin,
-    });
-  });
-
-  it("escalates the recovery floor on a repeated 429 without a short Retry-After", () => {
+  it("escalates the recovery floor on a repeated 429 without a usable Retry-After", () => {
     expect(rateLimitPlan({ ...healthy, recoveryInterval: 300 }, limited(), now)).toEqual({
       action: "backoff",
       delay: 2 * readingInterval,
@@ -180,12 +177,10 @@ describe("rate limit plan", () => {
 
 describe("recovery floor", () => {
   it("escalates on repeated 429s up to a cap", () => {
-    expect(escalatedRecovery(undefined, 30)).toBe(recoveryStartInterval);
-    expect(escalatedRecovery(300, 0)).toBe(600);
-    expect(escalatedRecovery(600, 0)).toBe(maxRecoveryInterval);
-    expect(escalatedRecovery(maxRecoveryInterval, 0)).toBe(maxRecoveryInterval);
-    // A server-provided Retry-After longer than the escalated floor wins outright.
-    expect(escalatedRecovery(300, 1200)).toBe(1200);
+    expect(escalatedRecovery(undefined)).toBe(recoveryStartInterval);
+    expect(escalatedRecovery(300)).toBe(600);
+    expect(escalatedRecovery(600)).toBe(maxRecoveryInterval);
+    expect(escalatedRecovery(maxRecoveryInterval)).toBe(maxRecoveryInterval);
   });
 
   it("decays toward recoveryClearInterval then clears", () => {
