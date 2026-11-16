@@ -3,6 +3,7 @@
 // contract; error bodies are `{"error": message}`.
 
 import { dashboardHtml } from "./dashboard";
+import { sessionLocationHint } from "./placement";
 import {
   basicAuthorization,
   ClientEventSanitizer,
@@ -201,7 +202,8 @@ async function retrying<T>(call: () => Promise<T>): Promise<T> {
 }
 
 function session(env: Env, username: string) {
-  return env.USER_SESSION.getByName(username);
+  const locationHint = sessionLocationHint(username);
+  return env.USER_SESSION.getByName(username, locationHint && { locationHint });
 }
 
 function registry(env: Env) {

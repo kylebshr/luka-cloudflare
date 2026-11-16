@@ -21,6 +21,7 @@ import {
   isCredentialError,
   lastPathComponent,
 } from "./dexcom";
+import { sessionLocationHint } from "./placement";
 import { type ApnsJwt, reportHeartbeat, type SessionCounts } from "./registry";
 import { redactedEmailLogID } from "./requests";
 import {
@@ -475,6 +476,7 @@ export class UserSession extends DurableObject<Env> {
       ...pollOutcome(result),
       // Which Dexcom Share host was polled: each region's host has its own rate limits.
       account_location: cred.accountLocation,
+      location_hint: sessionLocationHint(username) ?? "none",
       latency_ms: String(Date.now() - pollStart),
       recovery_active: String(state.recoveryInterval !== undefined),
     });
