@@ -663,8 +663,8 @@ export class UserSession extends DurableObject<Env> {
   }
 
   /**
-   * After a 429, applies the `rateLimitPlan`: either a quick retry on the server's short
-   * `Retry-After`, leaving the recovery floor untouched, or a backoff to a reading boundary
+   * After a 429, applies the `rateLimitPlan`: either a retry when the server's
+   * `Retry-After` allows, leaving the recovery floor untouched, or a backoff to a reading boundary
    * at least the raised recovery floor out. Once the limit clears, the floor eases polling
    * back in instead of resuming the aggressive overdue cadence.
    */
