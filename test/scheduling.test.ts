@@ -21,6 +21,7 @@ import {
   recoveryClearInterval,
   recoveryStartInterval,
   retryAfterMargin,
+  retryAfterSpread,
   staleLevel,
   supersededActivityIDs,
   trimReadings,
@@ -141,33 +142,45 @@ describe("rate limit plan", () => {
   const backoff = { action: "backoff", delay: readingInterval, recovery: recoveryStartInterval };
 
   it("retries when Retry-After allows, without entering recovery", () => {
-    expect(rateLimitPlan(healthy, limited("17"), now)).toEqual({ action: "retry_after", delay: 17 + retryAfterMargin });
-    expect(rateLimitPlan(healthy, limited("600"), now)).toEqual({
+    expect(rateLimitPlan(healthy, limited("17"), now, 0)).toEqual({
+      action: "retry_after",
+      delay: 17 + retryAfterMargin,
+    });
+    expect(rateLimitPlan(healthy, limited("600"), now, 0)).toEqual({
       action: "retry_after",
       delay: 600 + retryAfterMargin,
     });
-    expect(rateLimitPlan(healthy, limited("86400"), now)).toEqual({
+    expect(rateLimitPlan(healthy, limited("86400"), now, 0)).toEqual({
       action: "retry_after",
       delay: maxRetryAfter + retryAfterMargin,
     });
   });
 
+  it("spreads retries past the moment Retry-After names", () => {
+    expect(rateLimitPlan(healthy, limited("17"), now, 0.5)).toEqual({
+      action: "retry_after",
+      delay: 17 + retryAfterMargin + retryAfterSpread / 2,
+    });
+    // A backoff already lands on a reading boundary and isn't spread.
+    expect(rateLimitPlan(healthy, limited(), now, 0.5)).toEqual(backoff);
+  });
+
   it("follows Retry-After even while recovering", () => {
-    expect(rateLimitPlan({ ...healthy, recoveryInterval: 300 }, limited("17"), now)).toEqual({
+    expect(rateLimitPlan({ ...healthy, recoveryInterval: 300 }, limited("17"), now, 0)).toEqual({
       action: "retry_after",
       delay: 17 + retryAfterMargin,
     });
   });
 
   it("backs off without a usable Retry-After", () => {
-    expect(rateLimitPlan(healthy, limited(), now)).toEqual(backoff);
-    expect(rateLimitPlan(healthy, undefined, now)).toEqual(backoff);
-    expect(rateLimitPlan(healthy, limited("soon"), now)).toEqual(backoff);
-    expect(rateLimitPlan(healthy, limited("0"), now)).toEqual(backoff);
+    expect(rateLimitPlan(healthy, limited(), now, 0)).toEqual(backoff);
+    expect(rateLimitPlan(healthy, undefined, now, 0)).toEqual(backoff);
+    expect(rateLimitPlan(healthy, limited("soon"), now, 0)).toEqual(backoff);
+    expect(rateLimitPlan(healthy, limited("0"), now, 0)).toEqual(backoff);
   });
 
   it("escalates the recovery floor on a repeated 429 without a usable Retry-After", () => {
-    expect(rateLimitPlan({ ...healthy, recoveryInterval: 300 }, limited(), now)).toEqual({
+    expect(rateLimitPlan({ ...healthy, recoveryInterval: 300 }, limited(), now, 0)).toEqual({
       action: "backoff",
       delay: 2 * readingInterval,
       recovery: 600,

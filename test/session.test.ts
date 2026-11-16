@@ -30,6 +30,8 @@ let up: Upstreams;
 
 beforeEach(() => {
   useClock();
+  // No spread on rate-limit retries, so their times are exact.
+  vi.spyOn(Math, "random").mockReturnValue(0);
   up = new Upstreams();
 });
 
@@ -135,6 +137,7 @@ describe("poll cycle", () => {
         outcome: "success",
         status_code: "200",
         endpoint: "readings",
+        account_location: "usa",
         latency_ms: "0",
         recovery_active: "false",
       }),
