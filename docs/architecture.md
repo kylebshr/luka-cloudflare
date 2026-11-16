@@ -17,6 +17,7 @@ vs non-2xx elsewhere, and never reads an error body. Error bodies are this servi
 | `Registry` DO | `src/registry.ts` | Singleton (`getByName("global")`). Per-user counts for `/activity-count`, and the shared APNs provider JWT. |
 | Dexcom client | `src/dexcom.ts` | Share API client (port of `dexcom-swift`). |
 | Poll policy | `src/scheduling.ts` | Pure functions and constants: when to poll next, backoff, stale levels, supersede rule. |
+| Placement | `src/placement.ts` | Which sessions are hinted to another region. |
 | APNs | `src/apns.ts` | JWT signing, HTTP/2 sends via `fetch`, Live Activity payload builders. |
 | Alerts | `src/alerts.ts` | Out-of-range / rapid-trend alert text for reading updates. |
 | Telemetry | `src/telemetry.ts` | `emit`: one structured log line per event. |
@@ -180,7 +181,7 @@ characters).
 | `tokens_superseded` | log | A new activity replaced its device's older ones |
 | `restart_registered` | log | First registration after a push-to-start restart |
 | `session_ended` | log | `client_end`, `client_end_all`, `all_tokens_expired`, `apns_rejected` (every token dead), `dexcomError` (rejected credentials) |
-| `poll` | log | Every Dexcom poll (`outcome`, `status_code`, `endpoint`, `account_location`, …) |
+| `poll` | log | Every Dexcom poll (`outcome`, `status_code`, `endpoint`, `account_location`, `location_hint`, …) |
 | `poll_empty` | warn | Dexcom returned no readings |
 | `poll_error` | warn, or error when `will_end` | A failed poll (`error_type`: `credentials`, `dexcom`, `decoding`, `generic`) |
 | `poll_scheduled` | log | The next poll was set (`delay_s`, `recovery_interval`, `retry_count`) |
@@ -223,6 +224,12 @@ deployment did. Watch the 429 rate on `poll` events (`status_code == "429"`), sp
 `account_location` since each region has its own Dexcom host. Each 429's `poll_error` carries
 `rate_limit_action` (`retry_after` or `backoff`), `retry_after`, `body_prefix`, and
 `response_headers`, which is what distinguishes the edge limiter from Dexcom's own.
+
+A session's polls leave from the data center its Durable Object lives in, which is the
+one nearest the request that first reached it. To learn whether the US host limits polls
+from outside North America the same way, `src/placement.ts` hints a fixed share of
+usernames to Western Europe. Every `poll` carries `location_hint` (`weur` or `none`). A
+hint only takes effect when an object is first created.
 
 ## Tests
 
