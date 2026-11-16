@@ -49,6 +49,11 @@ export const maxRecoveryInterval = 60 * 15;
 export const maxRetryAfter = 60 * 30;
 // Added to `Retry-After` so the retry lands just after the limit clears.
 export const retryAfterMargin = 2;
+// Retries after a `Retry-After` are spread at random over this many further seconds. The
+// limit is shared by every session polling from the same data center, so sessions blocked
+// together are told to come back at the same instant; retrying in one burst is the kind
+// of traffic that starts the next block.
+export const retryAfterSpread = 10;
 
 /**
  * Lifetime of everything a session leaves behind (tombstones, the restart marker). A
@@ -155,8 +160,9 @@ export type RateLimitPlan =
 
 /**
  * The scheduling decision for a rate-limited poll. A 429 that carries a usable
- * `Retry-After` is retried right after the header says the limit clears, however many
- * times in a row, leaving the recovery floor as it was. Production 429s arrive on
+ * `Retry-After` is retried soon after the header says the limit clears (`spread`, a
+ * random fraction in [0, 1), places it within `retryAfterSpread`), however many times in
+ * a row, leaving the recovery floor as it was. Production 429s arrive on
  * ordinary boundary polls from sessions already at their minimum rate (one read per 5
  * minutes), answered by an edge limiter in a few ms with a plain-text body and a
  * `Retry-After` of seconds: a limit on the source address Workers share, which our
@@ -172,10 +178,11 @@ export function rateLimitPlan(
   state: Pick<PollState, "recoveryInterval" | "lastReading">,
   httpResponse: DexcomHTTPResponse | undefined,
   now: number,
+  spread: number,
 ): RateLimitPlan {
   const retryAfter = honoredRetryAfter(httpResponse);
   if (retryAfter !== undefined) {
-    return { action: "retry_after", delay: retryAfter + retryAfterMargin };
+    return { action: "retry_after", delay: retryAfter + retryAfterMargin + spread * retryAfterSpread };
   }
   const recovery = escalatedRecovery(state.recoveryInterval);
   const delay = delayUntilNextReading(state.lastReading?.date, now, recovery);

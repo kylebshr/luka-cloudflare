@@ -473,6 +473,8 @@ export class UserSession extends DurableObject<Env> {
     emit("poll", {
       user: logID,
       ...pollOutcome(result),
+      // Which Dexcom Share host was polled: each region's host has its own rate limits.
+      account_location: cred.accountLocation,
       latency_ms: String(Date.now() - pollStart),
       recovery_active: String(state.recoveryInterval !== undefined),
     });
@@ -565,7 +567,7 @@ export class UserSession extends DurableObject<Env> {
       // A rate limit whose body decoded as a Dexcom JSON error (app-level limiting, vs.
       // the edge limiter's plain-text and HTML bodies that surface as DexcomDecodingError).
       // Handle it the same way.
-      const plan = rateLimitPlan(state, error.httpResponse, Date.now());
+      const plan = rateLimitPlan(state, error.httpResponse, Date.now(), Math.random());
       emit(
         "poll_error",
         {
@@ -586,7 +588,8 @@ export class UserSession extends DurableObject<Env> {
       this.#rescheduleAfterRateLimit(cycle, plan);
       await this.#sendStaleUpdatesIfNeeded(cycle, "Rate limited");
     } else if (error instanceof DexcomDecodingError) {
-      const plan = error.statusCode === 429 ? rateLimitPlan(state, error.httpResponse, Date.now()) : undefined;
+      const plan =
+        error.statusCode === 429 ? rateLimitPlan(state, error.httpResponse, Date.now(), Math.random()) : undefined;
       emit(
         "poll_error",
         {
