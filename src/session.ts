@@ -30,10 +30,10 @@ import {
   errorRetryDelay,
   maximumDuration,
   overdueReschedule,
+  propagationBuffer,
   type RateLimitPlan,
   rateLimitPlan,
   readingInterval,
-  readingPropagationBuffer,
   staleLevel,
   supersededActivityIDs,
   trimReadings,
@@ -104,6 +104,8 @@ interface Cycle {
   state: PollState;
   /** The password the poll used. */
   password: string;
+  /** Seconds past a reading boundary to poll after a fresh reading. */
+  propagationBuffer: number;
   /** The activities registered when Dexcom was polled. */
   activityIDs: string[];
   /** Set once the cycle has decided when to poll next. */
@@ -420,6 +422,7 @@ export class UserSession extends DurableObject<Env> {
       logID: redactedEmailLogID(username),
       state: pollState,
       password: cred.password,
+      propagationBuffer: propagationBuffer(username),
       activityIDs: [],
     };
     const { now, logID, state } = cycle;
@@ -474,6 +477,8 @@ export class UserSession extends DurableObject<Env> {
     emit("poll", {
       user: logID,
       ...pollOutcome(result),
+      ...pollTiming(state, result, now),
+      propagation_buffer: String(cycle.propagationBuffer),
       // Which Dexcom Share host was polled: each region's host has its own rate limits.
       account_location: cred.accountLocation,
       location_hint: sessionLocationHint(username) ?? "none",
@@ -663,7 +668,7 @@ export class UserSession extends DurableObject<Env> {
   }
 
   #scheduleForNextReading(cycle: Cycle, readingDate: number, update?: ReadingUpdate): void {
-    const delay = readingInterval - (cycle.now - readingDate) / 1000 + readingPropagationBuffer;
+    const delay = readingInterval - (cycle.now - readingDate) / 1000 + cycle.propagationBuffer;
     this.#reschedule(cycle, { delay, healthy: true, update });
   }
 
@@ -1247,6 +1252,25 @@ function pollOutcome(result: PollResult): Record<string, string> {
     outcome: "error",
     status_code: httpResponse ? String(httpResponse.statusCode) : "unknown",
     endpoint: lastPathComponent(httpResponse?.url) ?? "unknown",
+  };
+}
+
+/**
+ * What the poll was for and whether it paid off, for tuning the poll timing: `poll_kind`
+ * is `retry` after a failed poll, `recheck` on the quick cadence for an overdue reading,
+ * otherwise `scheduled`. `since_last_reading_s` is how old the cached reading was when
+ * the poll began, `new_reading` whether the response carried a newer one, and
+ * `reading_age_s` how old that one was when the poll began.
+ */
+function pollTiming(state: PollState, result: PollResult, now: number): Record<string, string> {
+  const { lastReading } = state;
+  const latest = "readings" in result ? result.readings.at(-1) : undefined;
+  const isNew = latest !== undefined && (lastReading === undefined || latest.date > lastReading.date);
+  return {
+    poll_kind: state.retryCount > 0 ? "retry" : state.rechecking ? "recheck" : "scheduled",
+    since_last_reading_s: secondsAttribute(lastReading && (now - lastReading.date) / 1000),
+    new_reading: String(isNew),
+    reading_age_s: secondsAttribute(isNew ? (now - latest.date) / 1000 : undefined),
   };
 }
 

@@ -18,6 +18,7 @@ vs non-2xx elsewhere, and never reads an error body. Error bodies are this servi
 | Dexcom client | `src/dexcom.ts` | Share API client (port of `dexcom-swift`). |
 | Poll policy | `src/scheduling.ts` | Pure functions and constants: when to poll next, backoff, stale levels, supersede rule. |
 | Placement | `src/placement.ts` | Which sessions are hinted to another region. |
+| Cohorts | `src/cohort.ts` | Stable assignment of usernames to trial groups. |
 | APNs | `src/apns.ts` | JWT signing, HTTP/2 sends via `fetch`, Live Activity payload builders. |
 | Alerts | `src/alerts.ts` | Out-of-range / rapid-trend alert text for reading updates. |
 | Telemetry | `src/telemetry.ts` | `emit`: one structured log line per event. |
@@ -181,7 +182,7 @@ characters).
 | `tokens_superseded` | log | A new activity replaced its device's older ones |
 | `restart_registered` | log | First registration after a push-to-start restart |
 | `session_ended` | log | `client_end`, `client_end_all`, `all_tokens_expired`, `apns_rejected` (every token dead), `dexcomError` (rejected credentials) |
-| `poll` | log | Every Dexcom poll (`outcome`, `status_code`, `endpoint`, `account_location`, `location_hint`, …) |
+| `poll` | log | Every Dexcom poll (`outcome`, `status_code`, `endpoint`, `account_location`, `location_hint`, and the timing fields under [Poll timing](#poll-timing)) |
 | `poll_empty` | warn | Dexcom returned no readings |
 | `poll_error` | warn, or error when `will_end` | A failed poll (`error_type`: `credentials`, `dexcom`, `decoding`, `generic`) |
 | `poll_scheduled` | log | The next poll was set (`delay_s`, `recovery_interval`, `retry_count`) |
@@ -230,6 +231,29 @@ one nearest the request that first reached it. To learn whether the US host limi
 from outside North America the same way, `src/placement.ts` hints a fixed share of
 usernames to Western Europe. Every `poll` carries `location_hint` (`weur` or `none`). A
 hint only takes effect when an object is first created.
+
+## Poll timing
+
+Every `poll` event records what the poll was for and whether it paid off, which is the
+data for tuning the constants in `src/scheduling.ts`:
+
+| Attribute | Meaning |
+|---|---|
+| `poll_kind` | `scheduled`, `recheck` (quick cadence for an overdue reading), or `retry` (after a failed poll) |
+| `since_last_reading_s` | Age of the cached reading when the poll began, or `none` |
+| `new_reading` | Whether the response carried a newer reading |
+| `reading_age_s` | Age of that new reading when the poll began, or `none` |
+| `propagation_buffer` | Seconds past a reading boundary this username polls after a fresh reading |
+
+A `scheduled` poll with `since_last_reading_s` just over 300 is the first poll for a due
+reading; its `new_reading` rate is the hit rate of the propagation buffer. A `recheck`
+poll's `since_last_reading_s` says which recheck it was, so `new_reading` by that value
+shows what each recheck finds.
+
+`readingPropagationBuffer` is 20 seconds. To learn whether a shorter wait finds the
+reading as often, `propagationBuffer` gives a tenth of usernames 10 seconds and another
+tenth 15 seconds for the poll that follows a fresh reading. Compare `new_reading` on first
+polls between `propagation_buffer` values.
 
 ## Tests
 

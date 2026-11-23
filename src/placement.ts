@@ -7,6 +7,8 @@
 // Europe to find out: compare the 429 rate of `account_location: "usa"` polls between
 // `location_hint` values.
 
+import { cohortFraction } from "./cohort";
+
 /** Share of usernames hinted to `hintedLocation`. */
 export const hintedShare = 0.2;
 export const hintedLocation: DurableObjectLocationHint = "weur";
@@ -17,10 +19,5 @@ export const hintedLocation: DurableObjectLocationHint = "weur";
  * names a region, not a data center.
  */
 export function sessionLocationHint(username: string): DurableObjectLocationHint | undefined {
-  // FNV-1a.
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < username.length; index++) {
-    hash = Math.imul(hash ^ username.charCodeAt(index), 0x01000193);
-  }
-  return (hash >>> 0) / 2 ** 32 < hintedShare ? hintedLocation : undefined;
+  return cohortFraction(username) < hintedShare ? hintedLocation : undefined;
 }

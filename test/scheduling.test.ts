@@ -15,6 +15,7 @@ import {
   overdueFirstRetryInterval,
   overdueReschedule,
   overdueRetryInterval,
+  propagationBuffer,
   rateLimitPlan,
   readingInterval,
   readingPropagationBuffer,
@@ -24,6 +25,8 @@ import {
   retryAfterSpread,
   staleLevel,
   supersededActivityIDs,
+  trialBufferShare,
+  trialPropagationBuffers,
   trimReadings,
   unanchoredPollDelay,
 } from "../src/scheduling";
@@ -266,5 +269,19 @@ describe("supersededActivityIDs", () => {
     expect(
       supersededActivityIDs(tokens, { activityID: "new", pushToStartToken: undefined, isNewActivity: true }),
     ).toEqual([]);
+  });
+});
+
+describe("propagationBuffer", () => {
+  it("puts a fixed share of usernames on each trial buffer, the same way every time", () => {
+    const usernames = Array.from({ length: 5000 }, (_, index) => `user${index}@example.com`);
+    const buffers = usernames.map(propagationBuffer);
+    expect(usernames.map(propagationBuffer)).toEqual(buffers);
+    for (const trial of trialPropagationBuffers) {
+      expect(buffers.filter((buffer) => buffer === trial).length / usernames.length).toBeCloseTo(trialBufferShare, 1);
+    }
+    expect(buffers.every((buffer) => [...trialPropagationBuffers, readingPropagationBuffer].includes(buffer))).toBe(
+      true,
+    );
   });
 });

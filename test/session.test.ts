@@ -137,6 +137,11 @@ describe("poll cycle", () => {
         outcome: "success",
         status_code: "200",
         endpoint: "readings",
+        poll_kind: "scheduled",
+        since_last_reading_s: "none",
+        new_reading: "true",
+        reading_age_s: "120",
+        propagation_buffer: "20",
         account_location: "usa",
         latency_ms: "0",
         recovery_active: "false",
@@ -196,6 +201,14 @@ describe("poll cycle", () => {
     expect((await stored()).nextPollAt).toBe(r1.date + minutes(10) + seconds(20));
     expect((await stored()).state?.rechecking).toBeUndefined();
     expect(up.pushes.every((push) => push.aps["content-state"].c.value === 120)).toBe(true);
+
+    // Each poll records what it was for and that it found nothing new.
+    const timing = { new_reading: "false", reading_age_s: "none" };
+    expect(up.eventsNamed("poll")).toMatchObject([
+      { ...timing, poll_kind: "scheduled", since_last_reading_s: "320" },
+      { ...timing, poll_kind: "recheck", since_last_reading_s: "340" },
+      { ...timing, poll_kind: "recheck", since_last_reading_s: "480" },
+    ]);
   });
 
   it("sends each stale milestone once, at 5, 10, and 15 minutes", async () => {
