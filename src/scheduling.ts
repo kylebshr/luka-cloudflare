@@ -3,6 +3,7 @@
 //
 // Units: intervals and delays are seconds; instants are epoch milliseconds.
 
+import { cohortFraction } from "./cohort";
 import type { DexcomHTTPResponse } from "./dexcom";
 import { type GlucoseReading, type PollState, StaleLevel, type TokenEntry } from "./types";
 
@@ -18,6 +19,11 @@ export const readingInterval = 60 * 5;
 // extra load to re-trigger per-account 429s. 20s keeps the boundary poll reliable so the
 // quick rechecks stay the exception.
 export const readingPropagationBuffer = 20;
+// Shorter buffers on trial, each used by `trialBufferShare` of usernames for the poll that
+// follows a fresh reading. A `poll` event's `propagation_buffer` and `new_reading` show
+// how often each buffer finds the reading on the first try.
+export const trialPropagationBuffers = [10, 15];
+export const trialBufferShare = 0.1;
 /** When a reading is considered offline. */
 export const offlineInterval = 60 * 15;
 /** Floor on staleDate so it's never in the past or near-now. */
@@ -61,6 +67,17 @@ export const retryAfterSpread = 10;
  * comfortably exceeds any active session while still letting leftovers expire.
  */
 export const dataTTLSeconds = 8 * 60 * 60;
+
+/**
+ * The wait past a reading boundary before the poll that follows a fresh reading for this
+ * username: one of `trialPropagationBuffers` for its share of usernames, otherwise
+ * `readingPropagationBuffer`. The same username always gets the same answer. Rechecks,
+ * retries and backoffs use `readingPropagationBuffer` for everyone.
+ */
+export function propagationBuffer(username: string): number {
+  const group = Math.floor(cohortFraction(`buffer:${username}`) / trialBufferShare);
+  return trialPropagationBuffers[group] ?? readingPropagationBuffer;
+}
 
 /**
  * Delay until the next reading boundary at least `minimumDelay` out, phase-anchored to
