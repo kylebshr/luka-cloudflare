@@ -3,27 +3,19 @@
 //
 // Units: intervals and delays are seconds; instants are epoch milliseconds.
 
-import { cohortFraction } from "./cohort";
 import type { DexcomHTTPResponse } from "./dexcom";
 import { type GlucoseReading, type PollState, StaleLevel, type TokenEntry } from "./types";
 
-// Recheck cadences for a reading that is due but hasn't appeared (the first recheck is
-// quicker), and how long past the expected arrival they apply — see overdueReschedule.
-export const overdueFirstRetryInterval = 20;
-export const overdueRetryInterval = 30;
-export const overdueCatchupWindow = 120;
+// How soon to recheck for a reading that the first poll after its boundary didn't find,
+// and how long past the boundary a miss still earns that recheck — see overdueReschedule.
+export const overdueRecheckInterval = 20;
+export const overdueCatchupWindow = 60;
 export const readingInterval = 60 * 5;
-// Extra wait past an expected reading boundary before polling for it, covering typical
-// Share-side propagation delay. At 10s roughly a third of boundary polls missed, and
-// every miss spent 1–4 catch-up rechecks of the account's Dexcom read budget — enough
-// extra load to re-trigger per-account 429s. 20s keeps the boundary poll reliable so the
-// quick rechecks stay the exception.
-export const readingPropagationBuffer = 20;
-// Shorter buffers on trial, each used by `trialBufferShare` of usernames for the poll that
-// follows a fresh reading. A `poll` event's `propagation_buffer` and `new_reading` show
-// how often each buffer finds the reading on the first try.
-export const trialPropagationBuffers = [10, 15];
-export const trialBufferShare = 0.1;
+// Extra wait past an expected reading boundary before polling for it, covering
+// Share-side propagation delay. Measured across production polls, about 85% of readings
+// are available 10s after the boundary and 97% at 15s; waiting until 20s finds no more,
+// and the rest arrive by 30–40s, where the recheck picks them up.
+export const readingPropagationBuffer = 15;
 /** When a reading is considered offline. */
 export const offlineInterval = 60 * 15;
 /** Floor on staleDate so it's never in the past or near-now. */
@@ -40,7 +32,7 @@ export const errorQuickRetryLimit = 5;
 // After a 429 that says nothing about when to come back, poll no more often than this at
 // first, then ease back (recoveryInterval shrinks to recoveryDecay of itself on each
 // healthy poll, and clears once it reaches recoveryClearInterval) rather than immediately
-// resuming the aggressive overdue cadence. Repeated 429s double the floor instead — see
+// resuming the overdue recheck. Repeated 429s double the floor instead — see
 // escalatedRecovery.
 export const recoveryStartInterval = 300;
 export const recoveryDecay = 0.6;
@@ -69,17 +61,6 @@ export const retryAfterSpread = 10;
 export const dataTTLSeconds = 8 * 60 * 60;
 
 /**
- * The wait past a reading boundary before the poll that follows a fresh reading for this
- * username: one of `trialPropagationBuffers` for its share of usernames, otherwise
- * `readingPropagationBuffer`. The same username always gets the same answer. Rechecks,
- * retries and backoffs use `readingPropagationBuffer` for everyone.
- */
-export function propagationBuffer(username: string): number {
-  const group = Math.floor(cohortFraction(`buffer:${username}`) / trialBufferShare);
-  return trialPropagationBuffers[group] ?? readingPropagationBuffer;
-}
-
-/**
  * Delay until the next reading boundary at least `minimumDelay` out, phase-anchored to
  * the last reading — readings arrive every `readingInterval`, plus
  * `readingPropagationBuffer` for Share-side propagation. Boundaries closer than
@@ -105,29 +86,26 @@ export function delayUntilNextReading(lastReadingDate: number | undefined, now: 
 
 /**
  * Scheduling decision for a poll that found the last reading overdue (due but not yet
- * available). Late readings usually land within a minute or two of the 5-minute mark
- * (Share-side propagation), so within `overdueCatchupWindow` past the expected arrival,
- * recheck on a quick cadence instead of backing off — extra quick for the first recheck,
- * when the reading is usually just seconds away. Peer Share clients behave the same way
- * (xDrip+ retries in ~10s steps around the expected boundary; Nightscout's share2 bridge
- * polls flat every 2.5 min). Past the window the reading is genuinely missing (sensor
- * gap, phone offline), so aim for each subsequent reading boundary instead —
+ * available). A reading missing at the boundary poll has usually landed 20 seconds later,
+ * so a miss within `overdueCatchupWindow` of the boundary gets one recheck after
+ * `overdueRecheckInterval`. A reading still missing at the recheck almost never turns up
+ * in the next minute or two (measured: under 1% of further rechecks found one); it is a
+ * sensor gap or an offline phone. From then on, aim for each subsequent reading boundary,
  * phase-anchored to the last reading, so a resumed stream is picked up seconds after it
- * lands rather than minutes. An active post-429 `recoveryInterval` disables the quick
- * cadence entirely: extra polls are what drew the 429, so a recovering session only
- * polls at reading boundaries at least the floor apart until recovery clears.
+ * lands. An active post-429 `recoveryInterval` disables the recheck: a recovering session
+ * only polls at reading boundaries at least the floor apart until recovery clears.
  */
 export function overdueReschedule(options: {
   lastReadingDate: number;
   now: number;
-  /** Whether the poll that found the reading overdue was itself a quick recheck. */
+  /** Whether the poll that found the reading overdue was itself the recheck. */
   rechecking: boolean;
   recoveryInterval: number | undefined;
 }): { delay: number; rechecking: boolean } {
   const { lastReadingDate, now, rechecking, recoveryInterval } = options;
   const timeSinceLastReading = (now - lastReadingDate) / 1000;
-  if (recoveryInterval === undefined && timeSinceLastReading < readingInterval + overdueCatchupWindow) {
-    return { delay: rechecking ? overdueRetryInterval : overdueFirstRetryInterval, rechecking: true };
+  if (!rechecking && recoveryInterval === undefined && timeSinceLastReading < readingInterval + overdueCatchupWindow) {
+    return { delay: overdueRecheckInterval, rechecking: true };
   }
   return { delay: delayUntilNextReading(lastReadingDate, now, recoveryInterval ?? 0), rechecking: false };
 }

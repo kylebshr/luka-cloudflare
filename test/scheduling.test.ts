@@ -12,10 +12,8 @@ import {
   maxRecoveryInterval,
   maxRetryAfter,
   overdueCatchupWindow,
-  overdueFirstRetryInterval,
+  overdueRecheckInterval,
   overdueReschedule,
-  overdueRetryInterval,
-  propagationBuffer,
   rateLimitPlan,
   readingInterval,
   readingPropagationBuffer,
@@ -25,8 +23,6 @@ import {
   retryAfterSpread,
   staleLevel,
   supersededActivityIDs,
-  trialBufferShare,
-  trialPropagationBuffers,
   trimReadings,
   unanchoredPollDelay,
 } from "../src/scheduling";
@@ -37,17 +33,18 @@ const at = (seconds: number) => lastReading + seconds * 1000;
 
 describe("rate limit rescheduling", () => {
   it("skips to the next reading after a rate limit", () => {
-    // Polled 20s after the expected reading and got rate limited: skip the missed reading
-    // and aim for the following one, 5 min out.
-    expect(delayUntilNextReading(lastReading, at(readingInterval + 20), recoveryStartInterval)).toBe(300);
+    const buffer = readingPropagationBuffer;
+    // Polled at the buffer past the expected reading and got rate limited: skip the missed
+    // reading and aim for the following one, 5 min out.
+    expect(delayUntilNextReading(lastReading, at(readingInterval + buffer), recoveryStartInterval)).toBe(300);
 
     // Rate limited 40s *before* a reading is due: don't aim for that imminent reading —
     // skip it and land on the following one (40s + 5m + the buffer).
-    expect(delayUntilNextReading(lastReading, at(readingInterval - 40), recoveryStartInterval)).toBe(360);
+    expect(delayUntilNextReading(lastReading, at(readingInterval - 40), recoveryStartInterval)).toBe(340 + buffer);
 
     // With no prior reading to anchor to, fall back to at least the floor.
     expect(delayUntilNextReading(undefined, at(readingInterval + 20), 600)).toBe(600);
-    expect(delayUntilNextReading(undefined, 0)).toBe(readingInterval + readingPropagationBuffer);
+    expect(delayUntilNextReading(undefined, 0)).toBe(readingInterval + buffer);
   });
 
   it("caps Retry-After and ignores one that gives nothing to follow", () => {
@@ -76,23 +73,21 @@ describe("overdueReschedule", () => {
       recoveryInterval: recovery,
     });
 
-  it("rechecks quickly through the catch-up window", () => {
-    // The boundary poll just missed: the first recheck is extra quick.
-    const first = overdue(readingInterval + readingPropagationBuffer);
-    expect(first).toEqual({ delay: overdueFirstRetryInterval, rechecking: true });
-
-    // A poll that was itself a recheck: the standard cadence from here on.
-    const second = overdue(readingInterval + readingPropagationBuffer + overdueFirstRetryInterval, true);
-    expect(second).toEqual({ delay: overdueRetryInterval, rechecking: true });
-
-    // Still inside the window a hair before it closes: same standard cadence.
-    const late = overdue(readingInterval + overdueCatchupWindow - 1, true);
-    expect(late.delay).toBe(overdueRetryInterval);
+  it("rechecks once when the boundary poll misses", () => {
+    expect(overdue(readingInterval + readingPropagationBuffer)).toEqual({
+      delay: overdueRecheckInterval,
+      rechecking: true,
+    });
+    // So does any other first miss inside the catch-up window, such as a retry after a 429.
+    expect(overdue(readingInterval + overdueCatchupWindow - 1).delay).toBe(overdueRecheckInterval);
   });
 
-  it("anchors to reading boundaries past the catch-up window", () => {
+  it("anchors to reading boundaries after the recheck or past the catch-up window", () => {
+    // The recheck missed too: the next boundary plus the buffer.
+    expect(overdue(readingInterval + 35, true)).toEqual({ delay: 265 + readingPropagationBuffer, rechecking: false });
+
     // 7.5 minutes since the last reading: aim for the 10:00 boundary plus the buffer.
-    expect(overdue(450, true)).toEqual({ delay: 150 + readingPropagationBuffer, rechecking: false });
+    expect(overdue(450)).toEqual({ delay: 150 + readingPropagationBuffer, rechecking: false });
 
     // Deep in a gap, a boundary+buffer poll lands on the next boundary+buffer.
     expect(overdue(10 * readingInterval + readingPropagationBuffer)).toEqual({
@@ -101,16 +96,16 @@ describe("overdueReschedule", () => {
     });
   });
 
-  it("disables the quick cadence during post-429 recovery", () => {
+  it("disables the recheck during post-429 recovery", () => {
     // Inside the catch-up window but recovering: aim for the next boundary at least the
     // recovery floor away.
-    expect(overdue(readingInterval + 20, false, recoveryStartInterval)).toEqual({
-      delay: 280 + readingPropagationBuffer,
+    expect(overdue(readingInterval + 10, false, recoveryStartInterval)).toEqual({
+      delay: 290 + readingPropagationBuffer,
       rechecking: false,
     });
 
-    // Even a mostly-decayed floor suppresses the quick cadence.
-    expect(overdue(readingInterval + 50, true, 120).delay).toBe(250 + readingPropagationBuffer);
+    // Even a mostly-decayed floor suppresses the recheck.
+    expect(overdue(readingInterval + 50, false, 120).delay).toBe(250 + readingPropagationBuffer);
 
     // Past the window, a boundary sooner than the floor is skipped for the next one.
     expect(overdue(450, false, 240).delay).toBe(450 + readingPropagationBuffer); // 15:00, not 10:00
@@ -126,7 +121,9 @@ describe("error retries", () => {
     expect(errorRetryDelay({ ...anchored, retryCount: errorQuickRetryLimit - 1 }, now)).toBe(errorRetryInterval);
     // A sustained outage: one poll per reading, landing just after each boundary.
     expect(errorRetryDelay({ ...anchored, retryCount: errorQuickRetryLimit }, now)).toBe(readingInterval);
-    expect(errorRetryDelay({ ...anchored, retryCount: 50 }, at(readingInterval + 200))).toBe(120);
+    expect(errorRetryDelay({ ...anchored, retryCount: 50 }, at(readingInterval + 200))).toBe(
+      100 + readingPropagationBuffer,
+    );
     // Never had a reading: the reading cadence.
     expect(errorRetryDelay({ retryCount: errorQuickRetryLimit }, now)).toBe(readingInterval + readingPropagationBuffer);
   });
@@ -269,19 +266,5 @@ describe("supersededActivityIDs", () => {
     expect(
       supersededActivityIDs(tokens, { activityID: "new", pushToStartToken: undefined, isNewActivity: true }),
     ).toEqual([]);
-  });
-});
-
-describe("propagationBuffer", () => {
-  it("puts a fixed share of usernames on each trial buffer, the same way every time", () => {
-    const usernames = Array.from({ length: 5000 }, (_, index) => `user${index}@example.com`);
-    const buffers = usernames.map(propagationBuffer);
-    expect(usernames.map(propagationBuffer)).toEqual(buffers);
-    for (const trial of trialPropagationBuffers) {
-      expect(buffers.filter((buffer) => buffer === trial).length / usernames.length).toBeCloseTo(trialBufferShare, 1);
-    }
-    expect(buffers.every((buffer) => [...trialPropagationBuffers, readingPropagationBuffer].includes(buffer))).toBe(
-      true,
-    );
   });
 });

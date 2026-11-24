@@ -30,10 +30,10 @@ import {
   errorRetryDelay,
   maximumDuration,
   overdueReschedule,
-  propagationBuffer,
   type RateLimitPlan,
   rateLimitPlan,
   readingInterval,
+  readingPropagationBuffer,
   staleLevel,
   supersededActivityIDs,
   trimReadings,
@@ -104,8 +104,6 @@ interface Cycle {
   state: PollState;
   /** The password the poll used. */
   password: string;
-  /** Seconds past a reading boundary to poll after a fresh reading. */
-  propagationBuffer: number;
   /** The activities registered when Dexcom was polled. */
   activityIDs: string[];
   /** Set once the cycle has decided when to poll next. */
@@ -422,7 +420,6 @@ export class UserSession extends DurableObject<Env> {
       logID: redactedEmailLogID(username),
       state: pollState,
       password: cred.password,
-      propagationBuffer: propagationBuffer(username),
       activityIDs: [],
     };
     const { now, logID, state } = cycle;
@@ -478,7 +475,6 @@ export class UserSession extends DurableObject<Env> {
       user: logID,
       ...pollOutcome(result),
       ...pollTiming(state, result, now),
-      propagation_buffer: String(cycle.propagationBuffer),
       // Which Dexcom Share host was polled: each region's host has its own rate limits.
       account_location: cred.accountLocation,
       location_hint: sessionLocationHint(username) ?? "none",
@@ -648,7 +644,7 @@ export class UserSession extends DurableObject<Env> {
 
   /**
    * After a poll that produced nothing newer than the cached reading: send any due stale
-   * milestone, then wait for the next expected reading or recheck on the overdue cadence.
+   * milestone, then wait for the next expected reading or recheck for an overdue one.
    */
   async #rescheduleWithoutNewReading(cycle: Cycle, lastReading: GlucoseReading): Promise<void> {
     const { state, now } = cycle;
@@ -668,7 +664,7 @@ export class UserSession extends DurableObject<Env> {
   }
 
   #scheduleForNextReading(cycle: Cycle, readingDate: number, update?: ReadingUpdate): void {
-    const delay = readingInterval - (cycle.now - readingDate) / 1000 + cycle.propagationBuffer;
+    const delay = readingInterval - (cycle.now - readingDate) / 1000 + readingPropagationBuffer;
     this.#reschedule(cycle, { delay, healthy: true, update });
   }
 
@@ -676,7 +672,7 @@ export class UserSession extends DurableObject<Env> {
    * After a 429, applies the `rateLimitPlan`: either a retry when the server's
    * `Retry-After` allows, leaving the recovery floor untouched, or a backoff to a reading boundary
    * at least the raised recovery floor out. Once the limit clears, the floor eases polling
-   * back in instead of resuming the aggressive overdue cadence.
+   * back in instead of resuming the overdue recheck.
    */
   #rescheduleAfterRateLimit(cycle: Cycle, plan: RateLimitPlan): void {
     const { state } = cycle;
@@ -704,7 +700,7 @@ export class UserSession extends DurableObject<Env> {
        */
       healthy: boolean;
       update?: ReadingUpdate;
-      /** The next poll is a quick recheck for an overdue reading. */
+      /** The next poll is the quick recheck for an overdue reading. */
       rechecking?: boolean;
     },
   ): void {
@@ -1257,7 +1253,7 @@ function pollOutcome(result: PollResult): Record<string, string> {
 
 /**
  * What the poll was for and whether it paid off, for tuning the poll timing: `poll_kind`
- * is `retry` after a failed poll, `recheck` on the quick cadence for an overdue reading,
+ * is `retry` after a failed poll, `recheck` for the one quick recheck of an overdue reading,
  * otherwise `scheduled`. `since_last_reading_s` is how old the cached reading was when
  * the poll began, `new_reading` whether the response carried a newer one, and
  * `reading_age_s` how old that one was when the poll began.
