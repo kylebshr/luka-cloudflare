@@ -239,21 +239,19 @@ data for tuning the constants in `src/scheduling.ts`:
 
 | Attribute | Meaning |
 |---|---|
-| `poll_kind` | `scheduled`, `recheck` (quick cadence for an overdue reading), or `retry` (after a failed poll) |
+| `poll_kind` | `scheduled`, `recheck` (the one quick recheck for an overdue reading), or `retry` (after a failed poll) |
 | `since_last_reading_s` | Age of the cached reading when the poll began, or `none` |
 | `new_reading` | Whether the response carried a newer reading |
 | `reading_age_s` | Age of that new reading when the poll began, or `none` |
-| `propagation_buffer` | Seconds past a reading boundary this username polls after a fresh reading |
 
 A `scheduled` poll with `since_last_reading_s` just over 300 is the first poll for a due
-reading; its `new_reading` rate is the hit rate of the propagation buffer. A `recheck`
-poll's `since_last_reading_s` says which recheck it was, so `new_reading` by that value
-shows what each recheck finds.
+reading; its `new_reading` rate is the hit rate of `readingPropagationBuffer`. The
+`new_reading` rate of `recheck` polls is what the recheck finds.
 
-`readingPropagationBuffer` is 20 seconds. To learn whether a shorter wait finds the
-reading as often, `propagationBuffer` gives a tenth of usernames 10 seconds and another
-tenth 15 seconds for the poll that follows a fresh reading. Compare `new_reading` on first
-polls between `propagation_buffer` values.
+About 85% of readings are available 10 seconds after their boundary and 97% at 15, with
+no more by 20; the rest arrive by 30 to 40 seconds. So the first poll waits 15 seconds and
+a miss is rechecked once, 20 seconds later. A reading still missing then is a sensor gap,
+and polling resumes at reading boundaries.
 
 ## Tests
 

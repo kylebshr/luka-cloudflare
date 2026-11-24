@@ -1,6 +1,7 @@
 import { env, reset, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { Registry } from "../src/registry";
+import { readingPropagationBuffer } from "../src/scheduling";
 import {
   accountID,
   advance,
@@ -43,6 +44,7 @@ afterEach(async () => {
 
 const hours = (n: number) => minutes(n * 60);
 const ref = referenceSeconds;
+const buffer = seconds(readingPropagationBuffer);
 const r1 = reading(120, T0 - minutes(2));
 const r0 = reading(115, T0 - minutes(7));
 const rateLimitedJSON = () => Response.json({ Code: null, Message: "Too many requests" }, { status: 429 });
@@ -116,7 +118,7 @@ describe("poll cycle", () => {
       retryCount: 0,
     });
     // The next reading is due 5 minutes after r1, plus the propagation buffer.
-    expect(nextPollAt).toBe(r1.date + minutes(5) + seconds(20));
+    expect(nextPollAt).toBe(r1.date + minutes(5) + buffer);
     expect((await stored()).alarm).toBe(nextPollAt);
 
     expect(up.eventsNamed("session_started")).toEqual([
@@ -141,7 +143,6 @@ describe("poll cycle", () => {
         since_last_reading_s: "none",
         new_reading: "true",
         reading_age_s: "120",
-        propagation_buffer: "20",
         account_location: "usa",
         latency_ms: "0",
         recovery_active: "false",
@@ -185,29 +186,29 @@ describe("poll cycle", () => {
     expect((await stored()).state).toMatchObject({ lastReading: r2, readings: [r0, r1, r2] });
   });
 
-  it("rechecks quickly when the reading is late, then settles onto reading boundaries", async () => {
+  it("rechecks once when the reading is late, then settles onto reading boundaries", async () => {
     await startAndPoll();
     up.clear();
 
-    // The boundary poll (5m20s after r1) misses: first recheck in 20s, then every 30s.
+    // The boundary poll misses: one recheck 20s later.
     await poll();
     expect((await stored()).nextPollAt).toBe(Date.now() + seconds(20));
     expect((await stored()).state?.rechecking).toBe(true);
-    await poll();
-    expect((await stored()).nextPollAt).toBe(Date.now() + seconds(30));
 
-    // Past the catch-up window (2 minutes after the expected reading): the next boundary.
-    await pollAt(r1.date + minutes(8));
-    expect((await stored()).nextPollAt).toBe(r1.date + minutes(10) + seconds(20));
+    // The recheck misses too: the next boundary, and every boundary after it.
+    await poll();
+    expect((await stored()).nextPollAt).toBe(r1.date + minutes(10) + buffer);
     expect((await stored()).state?.rechecking).toBeUndefined();
+    await poll();
+    expect((await stored()).nextPollAt).toBe(r1.date + minutes(15) + buffer);
     expect(up.pushes.every((push) => push.aps["content-state"].c.value === 120)).toBe(true);
 
     // Each poll records what it was for and that it found nothing new.
     const timing = { new_reading: "false", reading_age_s: "none" };
     expect(up.eventsNamed("poll")).toMatchObject([
-      { ...timing, poll_kind: "scheduled", since_last_reading_s: "320" },
-      { ...timing, poll_kind: "recheck", since_last_reading_s: "340" },
-      { ...timing, poll_kind: "recheck", since_last_reading_s: "480" },
+      { ...timing, poll_kind: "scheduled", since_last_reading_s: "315" },
+      { ...timing, poll_kind: "recheck", since_last_reading_s: "335" },
+      { ...timing, poll_kind: "scheduled", since_last_reading_s: "615" },
     ]);
   });
 
@@ -216,7 +217,7 @@ describe("poll cycle", () => {
     up.clear();
 
     const staleLevels = () => up.pushes.map((push) => [push.aps["content-state"].s, push.aps["content-state"].r]);
-    await poll(); // 5m20s
+    await poll(); // 5m15s
     await poll(); // 5m40s: same milestone, no push
     expect(staleLevels()).toEqual([[1, "No new readings"]]);
 
@@ -291,7 +292,7 @@ describe("rate limits", () => {
     up.clear();
     up.dexcom.ReadPublisherLatestGlucoseValues = rateLimitedJSON;
 
-    await poll(); // 5m20s after r1
+    await poll(); // 5m15s after r1
     expect(up.eventsNamed("poll")[0]).toMatchObject({
       outcome: "error",
       status_code: "429",
@@ -312,14 +313,14 @@ describe("rate limits", () => {
     let { state, nextPollAt } = await stored();
     expect(state).toMatchObject({ recoveryInterval: 300, retryCount: 1 });
     // At least the 300s floor, landing on the 10:20 boundary.
-    expect(nextPollAt).toBe(r1.date + minutes(10) + seconds(20));
+    expect(nextPollAt).toBe(r1.date + minutes(10) + buffer);
     expect(up.pushes.map((push) => push.aps["content-state"].r)).toEqual(["Rate limited"]);
     expect(await counts()).toEqual({ sessions: 1, activities: 1, rateLimited: 1 });
 
     await poll();
     ({ state, nextPollAt } = await stored());
     expect(state).toMatchObject({ recoveryInterval: 600, retryCount: 2 });
-    expect(nextPollAt).toBe(r1.date + minutes(20) + seconds(20));
+    expect(nextPollAt).toBe(r1.date + minutes(20) + buffer);
     expect(up.eventsNamed("poll")[1]).toMatchObject({ recovery_active: "true" });
 
     // Recovery: a healthy poll resets retries and relaxes the floor a step.
@@ -329,7 +330,7 @@ describe("rate limits", () => {
     await poll();
     ({ state, nextPollAt } = await stored());
     expect(state).toMatchObject({ recoveryInterval: 360, retryCount: 0 });
-    expect(nextPollAt).toBe(fresh.date + minutes(5) + seconds(20));
+    expect(nextPollAt).toBe(fresh.date + minutes(5) + buffer);
     expect(await counts()).toMatchObject({ rateLimited: 1 });
   });
 
@@ -375,7 +376,7 @@ describe("rate limits", () => {
       });
     up.dexcom.ReadPublisherLatestGlucoseValues = edgeLimited;
 
-    await poll(); // 5m20s after r1
+    await poll(); // 5m15s after r1
     const limitedAt = Date.now();
     expect(up.eventsNamed("poll_error")).toEqual([
       expect.objectContaining({
@@ -428,7 +429,7 @@ describe("rate limits", () => {
     expect(state).toMatchObject({ retryCount: 0 });
     expect(state?.lastReading).toEqual(fresh);
     expect(state?.recoveryInterval).toBeUndefined();
-    expect(nextPollAt).toBe(fresh.date + minutes(5) + seconds(20));
+    expect(nextPollAt).toBe(fresh.date + minutes(5) + buffer);
     expect(up.eventsNamed("poll_scheduled").at(-1)).toMatchObject({ recovery_interval: "none" });
   });
 
@@ -440,7 +441,7 @@ describe("rate limits", () => {
     });
     up.clear();
     await poll(); // overdue, but recovering: no 20s recheck
-    expect((await stored()).nextPollAt).toBe(r1.date + minutes(10) + seconds(20));
+    expect((await stored()).nextPollAt).toBe(r1.date + minutes(10) + buffer);
   });
 });
 
@@ -465,8 +466,8 @@ describe("errors", () => {
       await poll();
       expect((await stored()).nextPollAt).toBe(Date.now() + seconds(60));
     }
-    await poll(); // 10m20s after r1
-    expect((await stored()).nextPollAt).toBe(r1.date + minutes(15) + seconds(20));
+    await poll(); // 10m15s after r1
+    expect((await stored()).nextPollAt).toBe(r1.date + minutes(15) + buffer);
 
     // Far past the old retry limits, the session is still there, still retrying.
     for (let attempt = 7; attempt <= 20; attempt++) await poll();
@@ -782,7 +783,7 @@ describe("APNs rejections", () => {
     const after = await stored();
     expect(Object.keys(after.tokens)).toEqual(["activity-b"]);
     expect(after.ended).toMatchObject({ "activity-a": { reason: "apns_rejected" } });
-    expect(after.nextPollAt).toBe(r1.date + minutes(5) + seconds(20));
+    expect(after.nextPollAt).toBe(r1.date + minutes(5) + buffer);
     expect(await counts()).toMatchObject({ activities: 1 });
   });
 
@@ -901,7 +902,7 @@ describe("requests landing mid-poll", () => {
     const after = await stored();
     expect(Object.keys(after.tokens).sort()).toEqual(["activity-a", "activity-b"]);
     expect(after.state?.lastReading).toEqual(r1);
-    expect(after.nextPollAt).toBe(r1.date + minutes(5) + seconds(20));
+    expect(after.nextPollAt).toBe(r1.date + minutes(5) + buffer);
   });
 
   it("doesn't resurrect a session ended while Dexcom is being polled", async () => {
@@ -1181,7 +1182,7 @@ describe("upstream timeouts", () => {
     expect(up.eventsNamed("push_failed")).toEqual([
       expect.objectContaining({ kind: "update", error_type: "other", error: "TimeoutError" }),
     ]);
-    expect((await stored()).nextPollAt).toBe(r1.date + minutes(5) + seconds(20));
+    expect((await stored()).nextPollAt).toBe(r1.date + minutes(5) + buffer);
   });
 });
 
@@ -1306,8 +1307,8 @@ describe("logging", () => {
     );
     expect(up.eventsNamed("poll_scheduled")[0]).toMatchObject({
       user: logID,
-      message: "Scheduled for 00:03:20 (in 3m 20s)",
-      delay_s: "200",
+      message: "Scheduled for 00:03:15 (in 3m 15s)",
+      delay_s: "195",
       retry_count: "0",
     });
     expect(up.eventsNamed("push_failed")[0]).toMatchObject({
